@@ -170,6 +170,29 @@ public class PostgresChunkReadGateTest {
         gate.runQueued();
 
         assertThat(ran).containsExactly("stop");
+        assertThat(gate.isRetryPending()).as("a chunk read is retried later").isTrue();
+    }
+
+    @Test
+    void anInterruptRaisedByARequestStopsThePassAndLeavesTheRestQueued() throws Exception {
+        gate.start();
+        List<String> ran = new ArrayList<>();
+        gate.queue("start", () -> {
+            ran.add("start");
+            // As the visibility check does when its wait is interrupted: the flag is kept, nothing is thrown.
+            Thread.currentThread().interrupt();
+        });
+        gate.queue("stop", () -> ran.add("stop"));
+        try {
+            assertThatThrownBy(gate::runQueued).isInstanceOf(InterruptedException.class);
+            assertThat(ran).containsExactly("start");
+        }
+        finally {
+            Thread.interrupted();
+        }
+
+        gate.runQueued();
+        assertThat(ran).containsExactly("start", "stop");
     }
 
     @Test
@@ -231,10 +254,6 @@ public class PostgresChunkReadGateTest {
                     return Map.of();
                 }
 
-                @Override
-                public Set<TableId> tablesWithDescendants() {
-                    return Set.of();
-                }
             }, Duration.ofSeconds(5));
         }
     }

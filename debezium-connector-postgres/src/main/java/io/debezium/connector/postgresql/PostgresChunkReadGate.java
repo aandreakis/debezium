@@ -33,8 +33,10 @@ import io.debezium.spi.schema.DataCollectionId;
  * started the incremental snapshot source), so the set of transactions whose changes were emitted is fixed during a
  * read and the snapshot's state has a single writer. A signal handled on another thread, for example from Kafka, JMX
  * or a file, is queued and runs on that thread at its next transaction commit or idle poll. Snapshot controls that
- * arrive on the stream's thread join the same queue, which then runs at once, so controls take effect in arrival
- * order. A queued request that fails is logged and skipped, as the signal processor does with a failing signal.</li>
+ * arrive on the stream's thread join the same queue, which then runs at once, so controls run in arrival order. A stop
+ * request is recorded and, as in stock Debezium, applied by the shared code at the next chunk read. A queued request
+ * that fails is logged and skipped, as the signal processor does with a failing signal, and a chunk read is retried
+ * later.</li>
  * <li>A chunk is read only when {@link PostgresCommitVisibilityGuard} confirms that every transaction whose changes
  * were emitted and that wrote a table the read can cover is visible to new snapshots. Otherwise the read is put off and retried at a commit or idle poll after
  * 1 s, doubling to 30 s while checks keep failing; any passing check clears the put-off read and resets the delay.
@@ -148,7 +150,9 @@ public class PostgresChunkReadGate {
 
     /**
      * Runs the queued snapshot work in arrival order on the stream's thread. A request that fails is logged and
-     * skipped. Work queued while the queue runs, also by the running work itself, runs after it in the same pass.
+     * skipped, and a chunk read is retried later, so a snapshot that the request left running without a pending read
+     * moves on. Work queued while the queue runs, also by the running work itself, runs after it in the same pass. An
+     * interrupt stops the pass; the rest stays queued.
      */
     public void runQueued() throws InterruptedException {
         if (running) {
@@ -157,13 +161,17 @@ public class PostgresChunkReadGate {
         running = true;
         try {
             Queued next;
-            while ((next = queued.poll()) != null) {
+            while (!Thread.currentThread().isInterrupted() && (next = queued.poll()) != null) {
                 try {
                     next.work.run();
                 }
                 catch (RuntimeException e) {
-                    LOGGER.warn("Incremental snapshot {} failed; the request may not have been processed", next.what, e);
+                    LOGGER.warn("Incremental snapshot {} failed; the request may not have been processed; a chunk read is retried later", next.what, e);
+                    retryLater();
                 }
+            }
+            if (Thread.currentThread().isInterrupted()) {
+                throw new InterruptedException("Interrupted while running queued incremental snapshot work");
             }
         }
         finally {

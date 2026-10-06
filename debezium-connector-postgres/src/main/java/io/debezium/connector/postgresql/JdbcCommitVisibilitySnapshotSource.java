@@ -26,18 +26,21 @@ public class JdbcCommitVisibilitySnapshotSource implements PostgresCommitVisibil
 
     private static final String STATE = "SELECT pg_is_in_recovery(), pg_current_snapshot()::text";
     private static final String STATE_BEFORE_13 = "SELECT pg_is_in_recovery(), txid_current_snapshot()::text";
-    private static final String RUNNING_WRITERS = "SELECT DISTINCT x.transactionid::text::bigint, n.nspname, c.relname"
+    /** Each running writer's transaction id with every table it holds a write lock on, and those tables' ancestors. */
+    static final String RUNNING_WRITERS = "WITH RECURSIVE written AS ("
+            + "SELECT DISTINCT x.transactionid::text::bigint AS xid, r.relation AS relid"
             + " FROM pg_catalog.pg_locks x"
             + " JOIN pg_catalog.pg_locks r ON r.virtualtransaction = x.virtualtransaction AND r.locktype = 'relation' AND r.granted"
             + " AND r.mode NOT IN ('AccessShareLock', 'RowShareLock')"
             + " AND r.database = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())"
             + " JOIN pg_catalog.pg_class c ON c.oid = r.relation AND c.relkind IN ('r', 'p') AND c.relpersistence <> 't'"
-            + " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
-            + " WHERE x.locktype = 'transactionid' AND x.mode = 'ExclusiveLock' AND x.granted";
-
-    private static final String TABLES_WITH_DESCENDANTS = "SELECT n.nspname, c.relname FROM pg_catalog.pg_class c"
-            + " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
-            + " WHERE c.relkind = 'p' OR EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhparent = c.oid)";
+            + " WHERE x.locktype = 'transactionid' AND x.mode = 'ExclusiveLock' AND x.granted"
+            + "), covered(xid, relid) AS ("
+            + "SELECT xid, relid FROM written"
+            + " UNION SELECT w.xid, i.inhparent FROM covered w JOIN pg_catalog.pg_inherits i ON i.inhrelid = w.relid"
+            + ") SELECT w.xid, n.nspname, c.relname FROM covered w"
+            + " JOIN pg_catalog.pg_class c ON c.oid = w.relid"
+            + " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace";
 
     private final PostgresConnection connection;
     private Boolean modern;
@@ -61,17 +64,6 @@ public class JdbcCommitVisibilitySnapshotSource implements PostgresCommitVisibil
                 writers.computeIfAbsent(rs.getLong(1), id -> new HashSet<>()).add(new TableId(null, rs.getString(2), rs.getString(3)));
             }
             return writers;
-        }));
-    }
-
-    @Override
-    public Set<TableId> tablesWithDescendants() throws SQLException {
-        return withAutoCommit(() -> connection.queryAndMap(TABLES_WITH_DESCENDANTS, rs -> {
-            final Set<TableId> tables = new HashSet<>();
-            while (rs.next()) {
-                tables.add(new TableId(null, rs.getString(1), rs.getString(2)));
-            }
-            return tables;
         }));
     }
 

@@ -9,6 +9,8 @@ import java.sql.SQLException;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 import org.slf4j.Logger;
@@ -66,9 +68,10 @@ import io.debezium.util.Clock;
  *      <li> on an idle standby the stream stops at the replay position. The window is then also released when the
  *      standby's startup process, which replays WAL, is seen waiting between two records and the replay position is
  *      still the release position: a record that was in replay when the release position was read has been replayed
- *      completely by then, which would have moved the replay position past it. Seeing the startup process's wait
- *      event needs the privileges of {@code pg_read_all_stats}; without them such a window waits for the next WAL
- *      record to be replayed</li>
+ *      completely by then, which would have moved the replay position past it. This is checked at most once a
+ *      second. Seeing the startup process's wait event needs the privileges of {@code pg_read_all_stats}; without
+ *      them such a window waits for the next WAL record to be replayed. While replay is paused, the window waits until
+ *      it resumes</li>
  * </ul>
  * </p>
  * <p>
@@ -95,6 +98,9 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
      * before a commit record is replayed.
      */
     static final Set<String> BETWEEN_RECORDS_WAIT_EVENTS = Set.of("RecoveryWalStream", "RecoveryRetrieveRetryInterval", "RecoveryApplyDelay");
+    /** The idle check runs at most once a second; its failures are logged at most every 30 s. */
+    static final long IDLE_CHECK_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
+    private static final long IDLE_CHECK_FAILURE_LOG_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(30);
     private static final String WAL_LAYOUT = "SELECT current_setting('wal_block_size')::bigint,"
             + " (SELECT setting::bigint FROM pg_catalog.pg_settings WHERE name = 'wal_segment_size')";
     /** {@code SizeOfXLogShortPHD} and {@code SizeOfXLogLongPHD} on 64-bit builds. */
@@ -106,9 +112,14 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
     private final PostgresSchema schema;
     private final PostgresChunkReadGate gate;
     private final Supplier<Lsn> serverPosition;
+    private final LongSupplier nanoClock;
     private long walBlockSize;
     private long walSegmentSize;
     private boolean startupProcessHiddenLogged;
+    private long lastIdleCheckNanos;
+    private boolean idleCheckDone;
+    private long idleCheckFailureLoggedNanos;
+    private boolean idleCheckFailureLogged;
 
     /**
      * @param serverPosition how far the server has sent the replication stream, as far as the connector has read it
@@ -128,7 +139,7 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
                                                                 Supplier<Lsn> serverPosition,
                                                                 PostgresConnection visibilityConnection) {
         this(config, jdbcConnection, dispatcher, databaseSchema, clock, progressListener, dataChangeEventListener, notificationService, serverPosition,
-                visibilityConnection, PostgresChunkReadGate.create(config, visibilityConnection));
+                visibilityConnection, PostgresChunkReadGate.create(config, visibilityConnection), System::nanoTime);
     }
 
     PostgresReadOnlyIncrementalSnapshotChangeEventSource(RelationalDatabaseConnectorConfig config,
@@ -141,13 +152,15 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
                                                          NotificationService<P, ? extends OffsetContext> notificationService,
                                                          Supplier<Lsn> serverPosition,
                                                          PostgresConnection visibilityConnection,
-                                                         PostgresChunkReadGate gate) {
+                                                         PostgresChunkReadGate gate,
+                                                         LongSupplier nanoClock) {
         super(config, jdbcConnection, dispatcher, databaseSchema, clock, progressListener, dataChangeEventListener, notificationService);
         this.jdbcConnection = (PostgresConnection) jdbcConnection;
         this.visibilityConnection = visibilityConnection;
         this.schema = (PostgresSchema) databaseSchema;
         this.serverPosition = serverPosition;
         this.gate = gate;
+        this.nanoClock = nanoClock;
     }
 
     private PostgresReadOnlyIncrementalSnapshotContext<TableId> getContext() {
@@ -339,11 +352,21 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
         if (!getContext().waitsAtReleasePosition(sent)) {
             return false;
         }
+        final long now = nanoClock.getAsLong();
+        if (idleCheckDone && now - lastIdleCheckNanos < IDLE_CHECK_INTERVAL_NANOS) {
+            return false;
+        }
+        idleCheckDone = true;
+        lastIdleCheckNanos = now;
         try {
             return replayIdleAt(getContext().getReleasePosition());
         }
         catch (SQLException | RuntimeException e) {
-            LOGGER.warn("Reading the standby's replay state failed; the window is released once the stream passes {}", getContext().getReleasePosition(), e);
+            if (!idleCheckFailureLogged || now - idleCheckFailureLoggedNanos >= IDLE_CHECK_FAILURE_LOG_INTERVAL_NANOS) {
+                idleCheckFailureLogged = true;
+                idleCheckFailureLoggedNanos = now;
+                LOGGER.warn("Reading the standby's replay state failed; the window is released once the stream passes {}", getContext().getReleasePosition(), e);
+            }
             return false;
         }
     }

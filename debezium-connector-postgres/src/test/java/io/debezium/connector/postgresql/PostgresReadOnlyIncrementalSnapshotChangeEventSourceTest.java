@@ -10,8 +10,10 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -21,6 +23,7 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.kafka.connect.data.Schema;
@@ -76,7 +79,7 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSourceTest {
         final PostgresChunkReadGate gate = new PostgresChunkReadGate(new PostgresChunkReadGateTest.ScriptedGuardBase(), clock::get);
         final PostgresConnection connection = visibilityConnection();
         when(connection.queryAndMap(anyString(), any())).thenThrow(new SQLException("connection lost"));
-        final TestSource source = new TestSource(mock(PostgresConnection.class), connection, gate);
+        final TestSource source = new TestSource(mock(PostgresConnection.class), connection, gate, clock);
         final PostgresReadOnlyIncrementalSnapshotContext<TableId> context = new PostgresReadOnlyIncrementalSnapshotContext<>();
         context.addDataCollectionNamesToSnapshot("signal-1", List.of("public.a"), List.of(), "");
         context.sendEvent(new Object[]{ 0 });
@@ -102,7 +105,7 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSourceTest {
         final PostgresConnection main = mock(PostgresConnection.class);
         final PostgresConnection connection = visibilityConnection();
         when(connection.queryAndMap(anyString(), any())).thenReturn(new Object[]{ true, null, "0/3000060" });
-        final TestSource source = new TestSource(main, connection, new PostgresChunkReadGate(new PostgresChunkReadGateTest.ScriptedGuardBase()));
+        final TestSource source = new TestSource(main, connection, new PostgresChunkReadGate(new PostgresChunkReadGateTest.ScriptedGuardBase()), new AtomicLong());
         final PostgresReadOnlyIncrementalSnapshotContext<TableId> context = new PostgresReadOnlyIncrementalSnapshotContext<>();
         context.addDataCollectionNamesToSnapshot("signal-1", List.of("public.a"), List.of(), "");
         source.useContext(context);
@@ -143,27 +146,71 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSourceTest {
                 .thenReturn(new Object[]{ true, null }, new Object[]{ true, "RecoveryConflictSnapshot" }, new Object[]{ true, "RecoveryWalStream" },
                         new Object[]{ false, null });
         when(connection.queryAndMap(eq(PostgresReadOnlyIncrementalSnapshotChangeEventSource.REPLAY_POSITION), any())).thenReturn("0/3000100");
-        final TestSource source = standbySourceWithWindowAt(connection, "0/3000060");
+        final AtomicLong clock = new AtomicLong();
+        final TestSource source = standbySourceWithWindowAt(connection, "0/3000060", clock);
 
         assertThat(source.releaseDueWhenIdle(Lsn.valueOf("0/3000060"))).as("the startup process is replaying").isFalse();
+        clock.addAndGet(PostgresReadOnlyIncrementalSnapshotChangeEventSource.IDLE_CHECK_INTERVAL_NANOS);
         assertThat(source.releaseDueWhenIdle(Lsn.valueOf("0/3000060"))).as("it waits inside a record's replay").isFalse();
         verify(connection, never()).queryAndMap(eq(PostgresReadOnlyIncrementalSnapshotChangeEventSource.REPLAY_POSITION), any());
+        clock.addAndGet(PostgresReadOnlyIncrementalSnapshotChangeEventSource.IDLE_CHECK_INTERVAL_NANOS);
         assertThat(source.releaseDueWhenIdle(Lsn.valueOf("0/3000060"))).as("a record was replayed since; the stream must pass it").isFalse();
+        clock.addAndGet(PostgresReadOnlyIncrementalSnapshotChangeEventSource.IDLE_CHECK_INTERVAL_NANOS);
         assertThat(source.releaseDueWhenIdle(Lsn.valueOf("0/3000060"))).as("without pg_read_all_stats the wait event is hidden").isFalse();
         assertThat(source.releaseDueWhenIdle(Lsn.valueOf("0/3000061"))).as("past the release position").isTrue();
     }
 
+    @Test
+    void theIdleCheckRunsAtMostOnceASecond() throws Exception {
+        final PostgresConnection connection = visibilityConnection();
+        when(connection.queryAndMap(eq(PostgresReadOnlyIncrementalSnapshotChangeEventSource.STARTUP_WAIT_EVENT), any())).thenReturn(new Object[]{ true, null });
+        final AtomicLong clock = new AtomicLong();
+        final TestSource source = standbySourceWithWindowAt(connection, "0/3000060", clock);
+
+        assertThat(source.releaseDueWhenIdle(Lsn.valueOf("0/3000060"))).isFalse();
+        clock.addAndGet(PostgresReadOnlyIncrementalSnapshotChangeEventSource.IDLE_CHECK_INTERVAL_NANOS - 1);
+        assertThat(source.releaseDueWhenIdle(Lsn.valueOf("0/3000060"))).isFalse();
+        verify(connection, times(1)).queryAndMap(eq(PostgresReadOnlyIncrementalSnapshotChangeEventSource.STARTUP_WAIT_EVENT), any());
+        clock.addAndGet(1);
+        assertThat(source.releaseDueWhenIdle(Lsn.valueOf("0/3000060"))).isFalse();
+        verify(connection, times(2)).queryAndMap(eq(PostgresReadOnlyIncrementalSnapshotChangeEventSource.STARTUP_WAIT_EVENT), any());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void theVisibilityCheckRunsOnItsOwnConnectionAndNeverOnTheMainOne() throws Exception {
+        final PostgresConnection main = mock(PostgresConnection.class);
+        final PostgresConnection connection = visibilityConnection();
+        when(connection.queryAndMap(anyString(), any())).thenAnswer(invocation -> ((String) invocation.getArgument(0)).startsWith("SELECT pg_is_in_recovery()")
+                ? new PostgresCommitVisibilityGuard.ServerState(false, PgSnapshot.valueOf("1:1:"))
+                : Map.of());
+        final PostgresReadOnlyIncrementalSnapshotChangeEventSource<PostgresPartition> source = new PostgresReadOnlyIncrementalSnapshotChangeEventSource<>(
+                mock(RelationalDatabaseConnectorConfig.class), main, null, mock(PostgresSchema.class), null, mock(SnapshotProgressListener.class), null,
+                mock(NotificationService.class, RETURNS_DEEP_STUBS), () -> null, connection);
+
+        source.init(null, null);
+
+        verify(connection, atLeastOnce()).queryAndMap(anyString(), any());
+        verify(main, never()).queryAndMap(anyString(), any());
+        verify(main, never()).commit();
+    }
+
     private static PostgresConnection visibilityConnection() throws SQLException {
         final PostgresConnection connection = mock(PostgresConnection.class);
-        final Connection jdbc = mock(Connection.class);
+        final Connection jdbc = mock(Connection.class, RETURNS_DEEP_STUBS);
         when(jdbc.getAutoCommit()).thenReturn(true);
+        when(jdbc.getMetaData().getDatabaseMajorVersion()).thenReturn(18);
         when(connection.connection()).thenReturn(jdbc);
         return connection;
     }
 
     private static TestSource standbySourceWithWindowAt(PostgresConnection connection, String releasePosition) {
+        return standbySourceWithWindowAt(connection, releasePosition, new AtomicLong());
+    }
+
+    private static TestSource standbySourceWithWindowAt(PostgresConnection connection, String releasePosition, AtomicLong clock) {
         final TestSource source = new TestSource(mock(PostgresConnection.class), connection,
-                new PostgresChunkReadGate(new PostgresChunkReadGateTest.ScriptedGuardBase()));
+                new PostgresChunkReadGate(new PostgresChunkReadGateTest.ScriptedGuardBase()), clock);
         final PostgresReadOnlyIncrementalSnapshotContext<TableId> context = new PostgresReadOnlyIncrementalSnapshotContext<>();
         context.chunkRead(Lsn.valueOf(releasePosition), true);
         source.useContext(context);
@@ -174,9 +221,9 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSourceTest {
         private static final Schema KEY_SCHEMA = SchemaBuilder.struct().field("id", Schema.INT32_SCHEMA).build();
 
         @SuppressWarnings("unchecked")
-        TestSource(PostgresConnection connection, PostgresConnection visibilityConnection, PostgresChunkReadGate gate) {
+        TestSource(PostgresConnection connection, PostgresConnection visibilityConnection, PostgresChunkReadGate gate, AtomicLong clock) {
             super(mock(RelationalDatabaseConnectorConfig.class), connection, null, mock(PostgresSchema.class), null, mock(SnapshotProgressListener.class), null,
-                    mock(NotificationService.class, RETURNS_DEEP_STUBS), () -> null, visibilityConnection, gate);
+                    mock(NotificationService.class, RETURNS_DEEP_STUBS), () -> null, visibilityConnection, gate, clock::get);
         }
 
         void useContext(PostgresReadOnlyIncrementalSnapshotContext<TableId> context) {
