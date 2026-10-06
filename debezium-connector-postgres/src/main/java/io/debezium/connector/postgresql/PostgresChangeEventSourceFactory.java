@@ -38,6 +38,7 @@ public class PostgresChangeEventSourceFactory implements ChangeEventSourceFactor
     private final ReplicationConnection replicationConnection;
     private final SlotCreationResult slotCreatedInfo;
     private final SlotState startingSlotInfo;
+    private volatile PostgresStreamingChangeEventSource streamingSource;
 
     public PostgresChangeEventSourceFactory(PostgresConnectorConfig configuration, SnapshotterService snapshotterService,
                                             MainConnectionProvidingConnectionFactory<PostgresConnection> connectionFactory,
@@ -75,7 +76,7 @@ public class PostgresChangeEventSourceFactory implements ChangeEventSourceFactor
 
     @Override
     public StreamingChangeEventSource<PostgresPartition, PostgresOffsetContext> getStreamingChangeEventSource() {
-        return new PostgresStreamingChangeEventSource(
+        final PostgresStreamingChangeEventSource source = new PostgresStreamingChangeEventSource(
                 configuration,
                 snapshotterService,
                 connectionFactory.mainConnection(),
@@ -85,6 +86,8 @@ public class PostgresChangeEventSourceFactory implements ChangeEventSourceFactor
                 schema,
                 taskContext,
                 replicationConnection);
+        streamingSource = source;
+        return source;
     }
 
     @Override
@@ -103,7 +106,11 @@ public class PostgresChangeEventSourceFactory implements ChangeEventSourceFactor
                     clock,
                     snapshotProgressListener,
                     dataChangeEventListener,
-                    notificationService));
+                    notificationService,
+                    () -> {
+                        final PostgresStreamingChangeEventSource streaming = streamingSource;
+                        return streaming == null ? null : streaming.lastServerPosition();
+                    }));
         }
 
         // If no data collection id is provided, don't return an instance as the implementation requires

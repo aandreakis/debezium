@@ -1052,6 +1052,13 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
             }
 
             @Override
+            public Lsn lastServerPosition() {
+                // pgJDBC raises its last receive LSN to the sent position of every keepalive it reads
+                final LogSequenceNumber position = stream.getLastReceiveLSN();
+                return position == null ? lastReceivedLsn : Lsn.valueOf(position);
+            }
+
+            @Override
             public void startKeepAlive(ExecutorService service) {
                 if (keepAliveExecutor == null) {
                     keepAliveExecutor = service;

@@ -6,12 +6,13 @@
 package io.debezium.connector.postgresql;
 
 import java.sql.SQLException;
-import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.DebeziumException;
+import io.debezium.connector.postgresql.connection.Lsn;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.jdbc.JdbcConnection;
 import io.debezium.pipeline.EventDispatcher;
@@ -28,8 +29,7 @@ import io.debezium.spi.schema.DataCollectionId;
 import io.debezium.util.Clock;
 
 /**
- * A PostgreSQL specific read-only incremental snapshot change event source.
- * Uses {@code PgSnapshot} as low/high watermarks for incremental snapshot window.
+ * A PostgreSQL specific read-only incremental snapshot change event source: it writes nothing to the database.
  * <p>
  * <b>Prerequisites</b>
  * <ul>
@@ -39,29 +39,25 @@ import io.debezium.util.Clock;
  * <p>
  * <b>How a chunk is snapshotted</b>
  * <ul>
- *      <li> a pg_current_snapshot() query is executed and the low watermark is set to lowWatermark </li>
- *      <li> a new data chunk is read from a database by generating the SELECT statement and placed into a window buffer keyed by primary keys </li>
- *      <li> a pg_current_snapshot() query is executed and the high watermark is set to highWatermark </li>
+ *      <li> a chunk is read on the replication stream's thread, at a transaction commit, an idle heartbeat, the
+ *      connector start or a snapshot signal, and only when every transaction whose changes were already emitted is
+ *      visible to new snapshots ({@link PostgresChunkReadGate}, {@link PostgresCommitVisibilityGuard}); otherwise
+ *      the read is retried later while streaming continues</li>
+ *      <li> the chunk is read into the window buffer keyed by primary keys</li>
+ *      <li> right after the chunk query, the current WAL position is read: the insert position on a primary, the
+ *      replay position on a standby; it is the window's release position</li>
  * </ul>
  * </p>
  * <p>
  * <b>During the subsequent streaming</b>
  * <ul>
- *      <li> if WAL event is received and its txId is greater then or equal to xMin of the low watermark, then window processing mode is enabled </li>
- *      <li> if WAL event is received and its txId is greater then the xMax of high watermark, then window processing mode is disabled and the rest of the window’s buffer is streamed </li>
- *      <li> if window processing mode is enabled then if the event key is contained in the window buffer then it is removed from the window buffer </li>
- *      <li> event is streamed </li>
+ *      <li> every event processed after the read removes the buffered row with the same key</li>
+ *      <li> at the first commit whose position is at or after the release position, or at an idle heartbeat once the
+ *      server has sent the stream up to it, the rest of the window's buffer is emitted and the next chunk is read.
+ *      Every transaction the chunk query saw committed before the release position, so it has been processed by
+ *      then</li>
  * </ul>
  * </p>
- * <br/>
- * <br/>
- * <b>No binlog events</b>
- * <p>Heartbeat events (events that are sent when there are not changes from the WAL) are used to update the window processing mode when the rate of WAL updates is low.</p>
- * <p>The heartbeat has the same txId as the latest WAL event at the moment and it will used to continue to read chunks even there are not event coming from the WAL. This processing will end if the watermarks changes because that means there are some transaction potentially modifying data.</p>
- * <br/>
- * <b>No changes between watermarks</b>
- * <p>A window can be opened and closed right away by the same event. This can happen when a high watermark and low watermark are the same, which means there were no active transaction during the chunk select. Chunk will get inserted right after the low watermark, no events will be deduplicated from the chunk</p>
- * <br/>
  *
  * @author Mario Fiore Vitale
  */
@@ -71,10 +67,12 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
     private static final Logger LOGGER = LoggerFactory.getLogger(PostgresReadOnlyIncrementalSnapshotChangeEventSource.class);
 
     private static final String FORCE_NEW_TRANSACTION = "SELECT (CASE pg_is_in_recovery() WHEN 't' THEN NULL::xid8 ELSE pg_current_xact_id() END) AS txid;";
-    private static final String CURRENT_SNAPSHOT = "SELECT * FROM pg_current_snapshot();";
+    private static final String CURRENT_WAL_POSITION = "SELECT (CASE pg_is_in_recovery() WHEN 't' THEN pg_last_wal_replay_lsn() ELSE pg_current_wal_insert_lsn() END)::text";
 
     private final PostgresConnection jdbcConnection;
     private final PostgresSchema schema;
+    private final PostgresChunkReadGate gate;
+    private final Supplier<Lsn> serverPosition;
 
     public PostgresReadOnlyIncrementalSnapshotChangeEventSource(RelationalDatabaseConnectorConfig config,
                                                                 JdbcConnection jdbcConnection,
@@ -84,10 +82,31 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
                                                                 SnapshotProgressListener<P> progressListener,
                                                                 DataChangeEventListener<P> dataChangeEventListener,
                                                                 NotificationService<P, ? extends OffsetContext> notificationService) {
+        this(config, jdbcConnection, dispatcher, databaseSchema, clock, progressListener, dataChangeEventListener, notificationService, () -> null);
+    }
+
+    /**
+     * @param serverPosition how far the server has sent the replication stream, as far as the connector has read it
+     *            (see {@link PostgresStreamingChangeEventSource#lastServerPosition()}); releases windows on an idle
+     *            stream
+     */
+    public PostgresReadOnlyIncrementalSnapshotChangeEventSource(RelationalDatabaseConnectorConfig config,
+                                                                JdbcConnection jdbcConnection,
+                                                                EventDispatcher<P, TableId> dispatcher,
+                                                                DatabaseSchema<?> databaseSchema,
+                                                                Clock clock,
+                                                                SnapshotProgressListener<P> progressListener,
+                                                                DataChangeEventListener<P> dataChangeEventListener,
+                                                                NotificationService<P, ? extends OffsetContext> notificationService,
+                                                                Supplier<Lsn> serverPosition) {
 
         super(config, jdbcConnection, dispatcher, databaseSchema, clock, progressListener, dataChangeEventListener, notificationService);
         this.jdbcConnection = (PostgresConnection) jdbcConnection;
         this.schema = (PostgresSchema) databaseSchema;
+        this.serverPosition = serverPosition;
+        this.gate = new PostgresChunkReadGate(new PostgresCommitVisibilityGuard(
+                new JdbcCommitVisibilitySnapshotSource(this.jdbcConnection),
+                PostgresChunkReadGate.inPlaceWait(config.getSignalProcessorSemaphoreWait())));
     }
 
     @Override
@@ -102,15 +121,34 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
     }
 
     @Override
-    protected void emitWindowOpen(P partition, OffsetContext offsetContext) {
+    public void init(P partition, OffsetContext offsetContext) {
+        gate.bindEventThread();
+        super.init(partition, offsetContext);
+    }
 
-        getCurrentSnapshot(getContext()::setLowWatermark);
+    @Override
+    protected boolean isReadyForChunkRead(P partition, OffsetContext offsetContext) {
+        return gate.readyForChunkRead();
+    }
+
+    @Override
+    protected void readChunk(P partition, OffsetContext offsetContext) throws InterruptedException {
+        if (!gate.onEventThread()) {
+            gate.deferReadToEventThread();
+            return;
+        }
+        super.readChunk(partition, offsetContext);
+    }
+
+    @Override
+    protected void emitWindowOpen(P partition, OffsetContext offsetContext) {
+        // The read decision is the window's start: every event processed from now on is compared with the buffer.
+        LOGGER.trace("Reading chunk {}", getContext().currentChunkId());
     }
 
     @Override
     protected void emitWindowClose(P partition, OffsetContext offsetContext) {
-
-        getCurrentSnapshot(getContext()::setHighWatermark);
+        getContext().chunkRead(currentWalPosition());
     }
 
     @Override
@@ -121,15 +159,8 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
             return;
         }
 
-        LOGGER.debug("Checking window for table '{}', key '{}', window contains '{}'", dataCollectionId, key, window);
-        getContext().updateWindowState(offsetContext);
-
-        boolean windowClosed = getContext().isWindowClosed();
-        if (getContext().snapshotRunning() && windowClosed) {
-            sendWindowEvents(partition, offsetContext);
-            readChunk(partition, offsetContext);
-        }
-        else if (!window.isEmpty() && getContext().deduplicationNeeded()) {
+        gate.recordEmitted(offsetContext);
+        if (!window.isEmpty()) {
             LOGGER.trace("Deduplicating");
             deduplicateWindow(dataCollectionId, key);
         }
@@ -137,28 +168,20 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
 
     @Override
     public void processTransactionCommittedEvent(P partition, OffsetContext offsetContext) throws InterruptedException {
-
-        if (getContext() == null) {
-            LOGGER.warn("Context is null, skipping message processing");
+        if (offsetContext == null) {
             return;
         }
-
-        LOGGER.trace("Processing transaction event");
-        readUntilNewTransactionChange(partition, offsetContext);
-        LOGGER.trace("Finished processing transaction event");
+        advance(partition, offsetContext, ((PostgresOffsetContext) offsetContext).lastCommitLsn());
     }
 
     @Override
     public void processHeartbeat(P partition, OffsetContext offsetContext) throws InterruptedException {
+        advance(partition, offsetContext, serverPosition.get());
+    }
 
-        if (getContext() == null) {
-            LOGGER.warn("Context is null, skipping message processing");
-            return;
-        }
-
-        LOGGER.trace("Processing heartbeat event");
-        readUntilNewTransactionChange(partition, offsetContext);
-        LOGGER.trace("Finished processing heartbeat event");
+    @Override
+    protected void postIncrementalSnapshotCompleted() {
+        gate.snapshotEnded();
     }
 
     @Override
@@ -168,66 +191,39 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
         return schema.tableFor(table.id());
     }
 
-    private void readUntilNewTransactionChange(P partition, OffsetContext offsetContext) throws InterruptedException {
-
-        Long eventTxId = offsetContext.getSourceInfo().getInt64(SourceInfo.TXID_KEY);
-
-        LOGGER.debug("Event txId {}, snapshot is running {}, reachedHighWatermark {}",
-                eventTxId, getContext().snapshotRunning(), getContext().isTransactionVisible(eventTxId));
-
-        LOGGER.trace("Incremental snapshot context {}", getContext());
-        if (getContext().snapshotRunning() && maxInProgressTransactionCommitted(eventTxId)) {
-            getContext().closeWindow();
-            sendWindowEvents(partition, offsetContext);
-            readChunk(partition, offsetContext);
-
+    /**
+     * At a commit or an idle heartbeat on the stream's thread: release the open window once the stream has been read
+     * up to its release position and read the next chunk, or run a chunk read that was put off.
+     */
+    private void advance(P partition, OffsetContext offsetContext, Lsn streamPosition) throws InterruptedException {
+        if (offsetContext == null || getContext() == null || !gate.onEventThread()) {
             return;
         }
-
-        while (getContext().snapshotRunning() && getContext().isTransactionVisible(eventTxId)) {
-
-            LOGGER.debug("Finishing snapshot, snapshot is running {}, reachedHighWatermark {}", getContext().snapshotRunning(),
-                    getContext().isTransactionVisible(eventTxId));
-
-            getContext().closeWindow();
-            sendWindowEvents(partition, offsetContext);
-            readChunk(partition, offsetContext);
-            if (getContext().watermarksChanged()) {
-                LOGGER.trace("Watermarks changed");
-                return;
+        gate.pruneIfOversized();
+        if (getContext().isWindowOpen()) {
+            if (getContext().releaseDue(streamPosition)) {
+                LOGGER.trace("Stream at {} reached the release position {}", streamPosition, getContext().getReleasePosition());
+                getContext().releaseWindow();
+                sendWindowEvents(partition, offsetContext);
+                readChunk(partition, offsetContext);
             }
-
-            LOGGER.trace("Re read chunk finished, snapshot is running {}, reachedHighWatermark {}", getContext().snapshotRunning(),
-                    getContext().isTransactionVisible(eventTxId));
+            return;
+        }
+        if (gate.retryDue()) {
+            readChunk(partition, offsetContext);
         }
     }
 
-    private void getCurrentSnapshot(Consumer<PgSnapshot> watermark) {
-
+    private Lsn currentWalPosition() {
         try {
-
-            PgSnapshot pgSnapshot = jdbcConnection.queryAndMap(CURRENT_SNAPSHOT, jdbcConnection.singleResultMapper(rs -> {
-
-                String currentSnapshot = rs.getString(1);
-                LOGGER.trace("Current snapshot {}", currentSnapshot);
-
-                return PgSnapshot.valueOf(currentSnapshot);
-            }, "Unable to get current snapshot"));
-
-            watermark.accept(pgSnapshot);
+            final Lsn position = jdbcConnection.queryAndMap(CURRENT_WAL_POSITION,
+                    jdbcConnection.singleResultMapper(rs -> Lsn.valueOf(rs.getString(1)), "Unable to read the current WAL position"));
+            LOGGER.trace("Release position {}", position);
+            return position;
         }
         catch (SQLException e) {
             throw new DebeziumException(e);
         }
-    }
-
-    private boolean maxInProgressTransactionCommitted(Long eventTxId) {
-
-        if (getContext().getHighWatermark() == null) {
-            return false;
-        }
-
-        return getContext().getHighWatermark().getXMax().equals(eventTxId);
     }
 
     private void forceNewTransactionId() {

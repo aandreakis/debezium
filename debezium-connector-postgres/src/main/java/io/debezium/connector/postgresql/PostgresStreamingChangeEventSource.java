@@ -253,6 +253,15 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
         }
     }
 
+    /**
+     * How far the server has sent the replication stream, as far as this source has read it; null before streaming
+     * starts. Call it from the streaming thread.
+     */
+    public Lsn lastServerPosition() {
+        final ReplicationStream stream = replicationStream.get();
+        return stream == null ? null : stream.lastServerPosition();
+    }
+
     private boolean haveNotReceivedStreamingStoppingLsn(PostgresOffsetContext offsetContext, Lsn lastCompletelyProcessedLsn) {
         return offsetContext.getStreamingStoppingLsn() == null ||
                 (lastCompletelyProcessedLsn.compareTo(offsetContext.getStreamingStoppingLsn()) < 0);

@@ -10,11 +10,16 @@ import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.connector.postgresql.connection.Lsn;
 import io.debezium.pipeline.source.snapshot.incremental.AbstractIncrementalSnapshotContext;
-import io.debezium.pipeline.spi.OffsetContext;
 
 /**
  * A class describing PostgreSQL read only incremental snapshot context state.
+ * <p>
+ * A chunk's window opens when the chunk is read and is released once the replication stream has been read up to the
+ * <em>release position</em>, a WAL position read right after the chunk query. Every transaction the chunk query saw
+ * committed before that position, so by then every one of them has been processed, and an event processed in between
+ * has removed the buffered row with the same key.
  *
  * @author Mario Fiore Vitale
  */
@@ -22,10 +27,7 @@ public class PostgresReadOnlyIncrementalSnapshotContext<T> extends AbstractIncre
 
     private static final Logger LOGGER = LoggerFactory.getLogger(PostgresReadOnlyIncrementalSnapshotContext.class);
 
-    private PgSnapshot lowWatermark;
-    private PgSnapshot highWatermark;
-    private PgSnapshot previousHighWatermark;
-    private PgSnapshot previousLowWatermark;
+    private Lsn releasePosition;
 
     public PostgresReadOnlyIncrementalSnapshotContext() {
         this(false);
@@ -45,70 +47,34 @@ public class PostgresReadOnlyIncrementalSnapshotContext<T> extends AbstractIncre
         return context;
     }
 
-    public PgSnapshot getLowWatermark() {
-        return lowWatermark;
+    /**
+     * A chunk was read; its window is released once the stream has been read up to {@code position}.
+     */
+    public void chunkRead(Lsn position) {
+        LOGGER.trace("Chunk read, window released at stream position {}", position);
+        releasePosition = position;
+        windowOpened = true;
     }
 
-    public void setLowWatermark(PgSnapshot lowWatermark) {
-        LOGGER.trace("Setting low watermark to {}", lowWatermark);
-        this.lowWatermark = lowWatermark;
+    /**
+     * Whether the window of the chunk read last can be released at the given stream position.
+     */
+    public boolean releaseDue(Lsn streamPosition) {
+        return windowOpened && releasePosition != null && streamPosition != null && streamPosition.isValid()
+                && streamPosition.compareTo(releasePosition) >= 0;
     }
 
-    public PgSnapshot getHighWatermark() {
-        return highWatermark;
-    }
-
-    public void setHighWatermark(PgSnapshot highWatermark) {
-        LOGGER.trace("Setting high watermark to {}", highWatermark);
-        this.highWatermark = highWatermark;
-    }
-
-    public void updateWindowState(OffsetContext offsetContext) {
-
-        Long eventTxId = offsetContext.getSourceInfo().getInt64(SourceInfo.TXID_KEY);
-        LOGGER.trace("Received event with TxId {}", eventTxId);
-        LOGGER.trace("Updating window. Window opened: {}, low watermark {}, high watermark {}", windowOpened, lowWatermark, highWatermark);
-
-        if (!windowOpened && lowWatermark != null) {
-            boolean pastLowWatermark = eventTxId >= lowWatermark.getXMin();
-            if (pastLowWatermark) {
-                LOGGER.debug("Current event txId {}, low watermark {}", eventTxId, lowWatermark);
-                windowOpened = true;
-            }
-        }
-        if (windowOpened && highWatermark != null) {
-            boolean pastHighWatermark = eventTxId > Math.max(highWatermark.getXMax(), lowWatermark.getXMax());
-            if (pastHighWatermark) {
-                LOGGER.debug("Current event txId {}, high watermark {}", eventTxId, highWatermark);
-                closeWindow();
-            }
-        }
-    }
-
-    public boolean isWindowClosed() {
-        return !windowOpened;
-    }
-
-    public void closeWindow() {
-        LOGGER.trace("Window closed. Low and High watermark cleaned");
+    public void releaseWindow() {
+        LOGGER.trace("Window released at release position {}", releasePosition);
         windowOpened = false;
-        previousHighWatermark = highWatermark;
-        highWatermark = null;
-        previousLowWatermark = lowWatermark;
-        lowWatermark = null;
+        releasePosition = null;
     }
 
-    public boolean isTransactionVisible(Long eventTxId) {
-
-        if (highWatermark == null) {
-            return false;
-        }
-        return eventTxId.compareTo(highWatermark.getXMin()) <= 0;
+    public boolean isWindowOpen() {
+        return windowOpened;
     }
 
-    public boolean watermarksChanged() {
-        LOGGER.trace("previousLowWatermark {}, lowWatermark {}, previousHighWatermark {}, highWatermark {}", previousLowWatermark, lowWatermark, previousHighWatermark,
-                highWatermark);
-        return !previousLowWatermark.equals(lowWatermark) || !previousHighWatermark.equals(highWatermark);
+    public Lsn getReleasePosition() {
+        return releasePosition;
     }
 }

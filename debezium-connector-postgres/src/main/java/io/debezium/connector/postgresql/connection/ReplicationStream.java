@@ -75,6 +75,17 @@ public interface ReplicationStream extends AutoCloseable {
     Lsn lastReceivedLsn();
 
     /**
+     * Returns how far the server has sent the stream, as far as this client has read it: the position of the last data
+     * message read, or the server's sent position from the last keepalive read, whichever is later. Every transaction
+     * that commits before this position has been read. Call it from the thread that reads the stream.
+     *
+     * @return the position, possibly null if this is called before anything has been read
+     */
+    default Lsn lastServerPosition() {
+        return lastReceivedLsn();
+    }
+
+    /**
      * Returns the value for the LSN form which the streaming is executed.
      *
      * @return a {@link Long} value, possibly null if starting LSN is undefined
