@@ -45,8 +45,12 @@ import io.debezium.relational.TableId;
  * wrote, until after it has become visible: PostgreSQL removes a committing transaction from the list of running
  * transactions before it releases its locks. So every transaction that was emitted earlier and is still invisible shows
  * up in {@code pg_locks} with its transaction id and its tables. The guard takes a snapshot, reads {@code pg_locks}, and
- * tracks, with their captured tables, the transactions that hold a write lock on a captured table and that the
+ * tracks, with their tables, the transactions that hold a write lock on a table of the current database and that the
  * snapshot does not show finished.</li>
+ * <li><b>Tables with descendants.</b> A transaction that wrote only a partition locks only the partition, while its
+ * change can be emitted under the partitioned table's name ({@code publish.via.partition.root}), and a chunk query
+ * selects from its table without {@code ONLY}. So the capture also lists the tables that are partitioned or have
+ * inheritance children, and a read that can cover one of them waits for every tracked transaction.</li>
  * <li><b>Check.</b> The guard prunes the tracked set with a new snapshot and, if transactions that wrote one of the
  * read's tables remain, polls new snapshots (every 1 ms, doubling to every 50 ms) for at most {@code maxWait} without
  * processing events, so the set can only shrink. Such a transaction pending longer than {@code maxWait} makes the check
@@ -75,8 +79,7 @@ public class PostgresCommitVisibilityGuard {
     private static final long UNSIGNED_INT_MASK = 0xFFFF_FFFFL;
 
     /**
-     * Database access of the guard. Each method ends the transaction it used before it returns, so every snapshot is
-     * new and the connection is never left idle in a transaction.
+     * Database access of the guard, on a connection of its own in autocommit mode, so every snapshot is new.
      */
     public interface SnapshotSource {
 
@@ -86,10 +89,15 @@ public class PostgresCommitVisibilityGuard {
         ServerState currentState() throws SQLException;
 
         /**
-         * The running transactions that hold a granted lock stronger than ROW SHARE on a captured table of the current
-         * database, read from {@code pg_locks}: their transaction ids (the low 32 bits) with those tables.
+         * The running transactions that hold a granted lock stronger than ROW SHARE on a table of the current database,
+         * read from {@code pg_locks}: their transaction ids (the low 32 bits) with those tables.
          */
-        Map<Long, Set<TableId>> runningWritersOfCapturedTables() throws SQLException;
+        Map<Long, Set<TableId>> runningWriters() throws SQLException;
+
+        /**
+         * The tables of the current database that are partitioned or have inheritance children.
+         */
+        Set<TableId> tablesWithDescendants() throws SQLException;
     }
 
     /**
@@ -146,6 +154,8 @@ public class PostgresCommitVisibilityGuard {
     private int currentIndex = -1;
     private PgSnapshot reference;
     private long referenceAtNanos;
+    /** The tables with descendants at the capture: a read that can cover one of them waits for every entry. */
+    private Set<TableId> tablesWithDescendants = Set.of();
     private long lastPruneNanos;
     private int consecutiveFailedChecks;
     private long failureLoggedAtNanos;
@@ -266,7 +276,7 @@ public class PostgresCommitVisibilityGuard {
         }
     }
 
-    private boolean check(Collection<TableId> readTables) throws SQLException, InterruptedException {
+    private boolean check(Collection<TableId> requestedTables) throws SQLException, InterruptedException {
         ServerState state = source.currentState();
         if (mode == Mode.UNKNOWN || (mode == Mode.STANDBY && !state.inRecovery())) {
             if (mode == Mode.STANDBY) {
@@ -282,6 +292,7 @@ public class PostgresCommitVisibilityGuard {
         if (state.inRecovery()) {
             throw new IllegalStateException("The server became a standby");
         }
+        final Collection<TableId> readTables = effective(requestedTables);
         final long pollStartedAt = nanoClock.getAsLong();
         prune(state.snapshot(), pollStartedAt);
         if (relevantCount(readTables) == 0) {
@@ -357,20 +368,22 @@ public class PostgresCommitVisibilityGuard {
             mode = Mode.STANDBY;
             return;
         }
+        final Set<TableId> withDescendants = source.tablesWithDescendants();
         final PgSnapshot snapshot = state.snapshot();
         final long now = nanoClock.getAsLong();
         prune(snapshot, now);
-        final Map<Long, Set<TableId>> writers = source.runningWritersOfCapturedTables();
+        final Map<Long, Set<TableId>> writers = source.runningWriters();
         for (Map.Entry<Long, Set<TableId>> writer : writers.entrySet()) {
             final long id = toFullTransactionId(snapshot.getXMax(), writer.getKey() & UNSIGNED_INT_MASK);
             if (!isFinished(snapshot, id)) {
                 addCaptured(id, now, writer.getValue());
             }
         }
+        tablesWithDescendants = Set.copyOf(withDescendants);
         mode = Mode.PRIMARY;
         if (!writers.isEmpty()) {
             LOGGER.info(
-                    "Commit-visibility check started: {} running transaction(s) hold write locks on captured tables, {} of them not yet visible; chunk reads of their tables wait until those end. Snapshot {}:{}",
+                    "Commit-visibility check started: {} running transaction(s) hold write locks, {} of them not yet visible; chunk reads of their tables wait until those end. Snapshot {}:{}",
                     writers.size(), size, snapshot.getXMin(), snapshot.getXMax());
         }
     }
@@ -450,6 +463,19 @@ public class PostgresCommitVisibilityGuard {
             }
         }
         return oldest;
+    }
+
+    /** The tables the filter uses for a read: every table when the read can cover a table with descendants. */
+    private Collection<TableId> effective(Collection<TableId> readTables) {
+        if (readTables == null) {
+            return null;
+        }
+        for (TableId table : readTables) {
+            if (tablesWithDescendants.contains(table)) {
+                return null;
+            }
+        }
+        return readTables;
     }
 
     /** Whether a transaction with the given tables can have changed a row of the given read tables. */

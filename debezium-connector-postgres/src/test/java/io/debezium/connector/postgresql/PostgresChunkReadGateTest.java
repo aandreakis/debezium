@@ -6,6 +6,7 @@
 package io.debezium.connector.postgresql;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.sql.SQLException;
 import java.time.Duration;
@@ -135,6 +136,72 @@ public class PostgresChunkReadGateTest {
     }
 
     @Test
+    void aControlOnTheStreamsThreadRunsAfterTheControlsQueuedBeforeIt() throws Exception {
+        gate.start();
+        List<String> ran = new ArrayList<>();
+        Thread other = new Thread(() -> {
+            try {
+                gate.control("pause", () -> ran.add("pause"));
+                gate.control("start", () -> ran.add("start"));
+            }
+            catch (InterruptedException e) {
+                throw new IllegalStateException(e);
+            }
+        });
+        other.start();
+        other.join();
+        assertThat(ran).as("controls from another thread wait for the stream's thread").isEmpty();
+
+        gate.control("resume", () -> ran.add("resume"));
+        gate.control("stop", () -> ran.add("stop"));
+
+        assertThat(ran).containsExactly("pause", "start", "resume", "stop");
+    }
+
+    @Test
+    void aFailingRequestIsSkippedAndTheNextOneRuns() throws Exception {
+        gate.start();
+        List<String> ran = new ArrayList<>();
+        gate.queue("start", () -> {
+            throw new IllegalArgumentException("bad data collection pattern");
+        });
+        gate.queue("stop", () -> ran.add("stop"));
+
+        gate.runQueued();
+
+        assertThat(ran).containsExactly("stop");
+    }
+
+    @Test
+    void anInterruptStopsTheQueueAndLeavesTheRestQueued() throws Exception {
+        gate.start();
+        List<String> ran = new ArrayList<>();
+        gate.queue("start", () -> {
+            throw new InterruptedException();
+        });
+        gate.queue("stop", () -> ran.add("stop"));
+
+        assertThatThrownBy(gate::runQueued).isInstanceOf(InterruptedException.class);
+        assertThat(ran).isEmpty();
+
+        gate.runQueued();
+        assertThat(ran).containsExactly("stop");
+    }
+
+    @Test
+    void aControlIssuedByRunningWorkRunsAfterThatWork() throws Exception {
+        gate.start();
+        List<String> ran = new ArrayList<>();
+        gate.control("resume", () -> {
+            ran.add("resume begins");
+            gate.control("window close", () -> ran.add("window close"));
+            ran.add("resume ends");
+        });
+
+        assertThat(ran).containsExactly("resume begins", "resume ends", "window close");
+    }
+
+    @Test
     void anUnboundGateTreatsEveryThreadAsTheStreamsThread() {
         assertThat(gate.onEventThread()).isTrue();
     }
@@ -160,8 +227,13 @@ public class PostgresChunkReadGateTest {
                 }
 
                 @Override
-                public Map<Long, Set<TableId>> runningWritersOfCapturedTables() {
+                public Map<Long, Set<TableId>> runningWriters() {
                     return Map.of();
+                }
+
+                @Override
+                public Set<TableId> tablesWithDescendants() {
+                    return Set.of();
                 }
             }, Duration.ofSeconds(5));
         }

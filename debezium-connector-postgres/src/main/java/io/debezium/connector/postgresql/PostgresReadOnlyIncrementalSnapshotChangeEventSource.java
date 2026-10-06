@@ -8,6 +8,7 @@ package io.debezium.connector.postgresql;
 import java.sql.SQLException;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Supplier;
 
 import org.slf4j.Logger;
@@ -50,8 +51,8 @@ import io.debezium.util.Clock;
  *      otherwise the read is retried later while streaming continues</li>
  *      <li> the chunk is read into the window buffer keyed by primary keys</li>
  *      <li> right after the chunk query, the window's release position is read: on a primary the WAL insert position,
- *      moved back over a page header that no record follows yet; on a standby the received position when it is at or
- *      after the replay position, otherwise the replay position, which the stream must then pass</li>
+ *      moved back over a page header that no record follows yet; on a standby the replay position, which the stream
+ *      must pass, because the commit record of a transaction the query saw can still be in replay and end after it</li>
  * </ul>
  * </p>
  * <p>
@@ -59,9 +60,20 @@ import io.debezium.util.Clock;
  * <ul>
  *      <li> every event processed after the read removes the buffered row with the same key</li>
  *      <li> at the first commit whose commit record ends at or after the release position, or on an idle stream once
- *      the server has sent the stream up to it, the rest of the window's buffer is emitted and the next chunk is read.
- *      Every transaction the chunk query saw has been processed by then</li>
+ *      the server has sent the stream up to it, the rest of the window's buffer is emitted and the next chunk is read;
+ *      on a standby the stream must be past the release position. Every transaction the chunk query saw has been
+ *      processed by then</li>
+ *      <li> on an idle standby the stream stops at the replay position. The window is then also released when the
+ *      standby's startup process, which replays WAL, is seen waiting between two records and the replay position is
+ *      still the release position: a record that was in replay when the release position was read has been replayed
+ *      completely by then, which would have moved the replay position past it. Seeing the startup process's wait
+ *      event needs the privileges of {@code pg_read_all_stats}; without them such a window waits for the next WAL
+ *      record to be replayed</li>
  * </ul>
+ * </p>
+ * <p>
+ * The release position and the startup process are read on a connection of its own in autocommit mode, so each
+ * reading of {@code pg_stat_activity} is new.
  * </p>
  *
  * @author Mario Fiore Vitale
@@ -73,8 +85,16 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
 
     private static final String RELEASE_POSITION = "SELECT pg_is_in_recovery(),"
             + " CASE WHEN pg_is_in_recovery() THEN NULL ELSE pg_current_wal_insert_lsn()::text END,"
-            + " CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()::text END,"
-            + " CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn()::text END";
+            + " CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()::text END";
+    static final String STARTUP_WAIT_EVENT = "SELECT pg_catalog.pg_has_role('pg_read_all_stats', 'USAGE'),"
+            + " (SELECT wait_event FROM pg_catalog.pg_stat_activity WHERE backend_type = 'startup')";
+    static final String REPLAY_POSITION = "SELECT pg_last_wal_replay_lsn()::text";
+    /**
+     * Wait events the startup process shows only between two records, after the replay position has moved to the end
+     * of the last replayed record: waiting for streamed WAL, waiting to retry the WAL sources, and the apply delay
+     * before a commit record is replayed.
+     */
+    static final Set<String> BETWEEN_RECORDS_WAIT_EVENTS = Set.of("RecoveryWalStream", "RecoveryRetrieveRetryInterval", "RecoveryApplyDelay");
     private static final String WAL_LAYOUT = "SELECT current_setting('wal_block_size')::bigint,"
             + " (SELECT setting::bigint FROM pg_catalog.pg_settings WHERE name = 'wal_segment_size')";
     /** {@code SizeOfXLogShortPHD} and {@code SizeOfXLogLongPHD} on 64-bit builds. */
@@ -82,27 +102,20 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
     static final long LONG_PAGE_HEADER = 40;
 
     private final PostgresConnection jdbcConnection;
+    private final PostgresConnection visibilityConnection;
     private final PostgresSchema schema;
     private final PostgresChunkReadGate gate;
     private final Supplier<Lsn> serverPosition;
     private long walBlockSize;
     private long walSegmentSize;
-
-    public PostgresReadOnlyIncrementalSnapshotChangeEventSource(RelationalDatabaseConnectorConfig config,
-                                                                JdbcConnection jdbcConnection,
-                                                                EventDispatcher<P, TableId> dispatcher,
-                                                                DatabaseSchema<?> databaseSchema,
-                                                                Clock clock,
-                                                                SnapshotProgressListener<P> progressListener,
-                                                                DataChangeEventListener<P> dataChangeEventListener,
-                                                                NotificationService<P, ? extends OffsetContext> notificationService) {
-        this(config, jdbcConnection, dispatcher, databaseSchema, clock, progressListener, dataChangeEventListener, notificationService, () -> null);
-    }
+    private boolean startupProcessHiddenLogged;
 
     /**
      * @param serverPosition how far the server has sent the replication stream, as far as the connector has read it
      *            (see {@link PostgresStreamingChangeEventSource#lastServerPosition()}); releases windows on an idle
      *            stream
+     * @param visibilityConnection a connection of its own for the commit-visibility check and the release position,
+     *            never the main connection; the caller closes it
      */
     public PostgresReadOnlyIncrementalSnapshotChangeEventSource(RelationalDatabaseConnectorConfig config,
                                                                 JdbcConnection jdbcConnection,
@@ -112,9 +125,10 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
                                                                 SnapshotProgressListener<P> progressListener,
                                                                 DataChangeEventListener<P> dataChangeEventListener,
                                                                 NotificationService<P, ? extends OffsetContext> notificationService,
-                                                                Supplier<Lsn> serverPosition) {
+                                                                Supplier<Lsn> serverPosition,
+                                                                PostgresConnection visibilityConnection) {
         this(config, jdbcConnection, dispatcher, databaseSchema, clock, progressListener, dataChangeEventListener, notificationService, serverPosition,
-                PostgresChunkReadGate.create(config, (PostgresConnection) jdbcConnection));
+                visibilityConnection, PostgresChunkReadGate.create(config, visibilityConnection));
     }
 
     PostgresReadOnlyIncrementalSnapshotChangeEventSource(RelationalDatabaseConnectorConfig config,
@@ -126,9 +140,11 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
                                                          DataChangeEventListener<P> dataChangeEventListener,
                                                          NotificationService<P, ? extends OffsetContext> notificationService,
                                                          Supplier<Lsn> serverPosition,
+                                                         PostgresConnection visibilityConnection,
                                                          PostgresChunkReadGate gate) {
         super(config, jdbcConnection, dispatcher, databaseSchema, clock, progressListener, dataChangeEventListener, notificationService);
         this.jdbcConnection = (PostgresConnection) jdbcConnection;
+        this.visibilityConnection = visibilityConnection;
         this.schema = (PostgresSchema) databaseSchema;
         this.serverPosition = serverPosition;
         this.gate = gate;
@@ -165,47 +181,38 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
 
     @Override
     public void closeWindow(P partition, String id, OffsetContext offsetContext) throws InterruptedException {
-        if (!gate.onEventThread()) {
-            gate.queue("window close", () -> closeWindow(partition, id, offsetContext));
-            return;
-        }
-        super.closeWindow(partition, id, offsetContext);
+        gate.control("window close", () -> super.closeWindow(partition, id, offsetContext));
     }
 
     @Override
     public void pauseSnapshot(P partition, OffsetContext offsetContext) {
-        if (!gate.onEventThread()) {
-            gate.queue("pause", () -> pauseSnapshot(partition, offsetContext));
-            return;
-        }
-        super.pauseSnapshot(partition, offsetContext);
+        controlWithoutInterrupt("pause", () -> super.pauseSnapshot(partition, offsetContext));
     }
 
     @Override
     public void resumeSnapshot(P partition, OffsetContext offsetContext) throws InterruptedException {
-        if (!gate.onEventThread()) {
-            gate.queue("resume", () -> resumeSnapshot(partition, offsetContext));
-            return;
-        }
-        super.resumeSnapshot(partition, offsetContext);
+        gate.control("resume", () -> super.resumeSnapshot(partition, offsetContext));
     }
 
     @Override
     public void addDataCollectionNamesToSnapshot(SignalPayload<P> signalPayload, SnapshotConfiguration snapshotConfiguration) throws InterruptedException {
-        if (!gate.onEventThread()) {
-            gate.queue("start", () -> addDataCollectionNamesToSnapshot(signalPayload, snapshotConfiguration));
-            return;
-        }
-        super.addDataCollectionNamesToSnapshot(signalPayload, snapshotConfiguration);
+        gate.control("start", () -> super.addDataCollectionNamesToSnapshot(signalPayload, snapshotConfiguration));
     }
 
     @Override
     public void requestStopSnapshot(P partition, OffsetContext offsetContext, Map<String, Object> additionalData, List<String> dataCollectionIds) {
-        if (!gate.onEventThread()) {
-            gate.queue("stop", () -> requestStopSnapshot(partition, offsetContext, additionalData, dataCollectionIds));
-            return;
+        controlWithoutInterrupt("stop", () -> super.requestStopSnapshot(partition, offsetContext, additionalData, dataCollectionIds));
+    }
+
+    /** A control whose caller cannot be interrupted: an interrupt while the queue runs is kept for the thread. */
+    private void controlWithoutInterrupt(String what, PostgresChunkReadGate.Work work) {
+        try {
+            gate.control(what, work);
         }
-        super.requestStopSnapshot(partition, offsetContext, additionalData, dataCollectionIds);
+        catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOGGER.info("Interrupted while running incremental snapshot {}", what);
+        }
     }
 
     @Override
@@ -287,7 +294,7 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
         if (getContext().isWindowOpen()) {
             final boolean due = atCommit
                     ? getContext().releaseDueAtCommit(((PostgresOffsetContext) offsetContext).lastCommitLsn())
-                    : getContext().releaseDueWhenIdle(serverPosition.get());
+                    : releaseDueWhenIdle(serverPosition.get());
             if (due) {
                 LOGGER.trace("Stream reached the release position {}", getContext().getReleasePosition());
                 getContext().releaseWindow();
@@ -302,11 +309,11 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
     }
 
     private void readReleasePosition() throws SQLException {
-        final Object[] row = jdbcConnection.queryAndMap(RELEASE_POSITION, jdbcConnection.singleResultMapper(
-                rs -> new Object[]{ rs.getBoolean(1), rs.getString(2), rs.getString(3), rs.getString(4) },
-                "Unable to read the current WAL position"));
-        // End the chunk query's transaction, so the connection does not stay idle in a transaction.
+        // End the chunk query's transaction, so the main connection does not stay idle in a transaction.
         jdbcConnection.commit();
+        final Object[] row = autoCommit().queryAndMap(RELEASE_POSITION, visibilityConnection.singleResultMapper(
+                rs -> new Object[]{ rs.getBoolean(1), rs.getString(2), rs.getString(3) },
+                "Unable to read the current WAL position"));
         final boolean inRecovery = (Boolean) row[0];
         if (!inRecovery) {
             final Lsn insert = Lsn.valueOf((String) row[1]);
@@ -317,16 +324,60 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
         if (row[2] == null) {
             throw new SQLException("The standby has not replayed any WAL yet");
         }
-        final Lsn replay = Lsn.valueOf((String) row[2]);
-        final Lsn received = row[3] == null ? null : Lsn.valueOf((String) row[3]);
-        if (received != null && received.compareTo(replay) >= 0) {
-            // Every record that is or was in replay was received and flushed first, so it ends at or before this.
-            getContext().chunkRead(received, false);
+        // A record in replay can be visible already and end after the replay position: the stream must pass it.
+        getContext().chunkRead(Lsn.valueOf((String) row[2]), true);
+    }
+
+    /**
+     * On an idle poll: whether the stream has reached the release position, or, on a standby, passed it, or sits at it
+     * while the standby's startup process waits between two records with the replay position still there.
+     */
+    boolean releaseDueWhenIdle(Lsn sent) {
+        if (getContext().releaseDueWhenIdle(sent)) {
+            return true;
         }
-        else {
-            // A record in replay can be visible already and end after the replay position: the stream must pass it.
-            getContext().chunkRead(replay, true);
+        if (!getContext().waitsAtReleasePosition(sent)) {
+            return false;
         }
+        try {
+            return replayIdleAt(getContext().getReleasePosition());
+        }
+        catch (SQLException | RuntimeException e) {
+            LOGGER.warn("Reading the standby's replay state failed; the window is released once the stream passes {}", getContext().getReleasePosition(), e);
+            return false;
+        }
+    }
+
+    /**
+     * Whether the startup process is seen waiting between two records and, read after that, the replay position is
+     * {@code releasePosition}. A record that was in replay when the release position was read has then been replayed
+     * completely, and its end would be after {@code releasePosition}.
+     */
+    private boolean replayIdleAt(Lsn releasePosition) throws SQLException {
+        final Object[] startup = autoCommit().queryAndMap(STARTUP_WAIT_EVENT, visibilityConnection.singleResultMapper(
+                rs -> new Object[]{ rs.getBoolean(1), rs.getString(2) }, "Unable to read the startup process's wait event"));
+        if (!(Boolean) startup[0]) {
+            if (!startupProcessHiddenLogged) {
+                startupProcessHiddenLogged = true;
+                LOGGER.warn("The connector's user lacks the privileges of pg_read_all_stats, so it cannot see whether the standby's startup process is idle; "
+                        + "on an idle standby an incremental snapshot chunk then waits until the next WAL record is replayed");
+            }
+            return false;
+        }
+        if (startup[1] == null || !BETWEEN_RECORDS_WAIT_EVENTS.contains((String) startup[1])) {
+            return false;
+        }
+        final String replay = visibilityConnection.queryAndMap(REPLAY_POSITION, visibilityConnection.singleResultMapper(
+                rs -> rs.getString(1), "Unable to read the replay position"));
+        return replay != null && Lsn.valueOf(replay).equals(releasePosition);
+    }
+
+    /** The release connection in autocommit mode, so each statement sees new server state. */
+    private PostgresConnection autoCommit() throws SQLException {
+        if (!visibilityConnection.connection().getAutoCommit()) {
+            visibilityConnection.connection().setAutoCommit(true);
+        }
+        return visibilityConnection;
     }
 
     /**
@@ -347,9 +398,8 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
         if (walBlockSize > 0) {
             return;
         }
-        final long[] layout = jdbcConnection.queryAndMap(WAL_LAYOUT, jdbcConnection.singleResultMapper(
+        final long[] layout = autoCommit().queryAndMap(WAL_LAYOUT, visibilityConnection.singleResultMapper(
                 rs -> new long[]{ rs.getLong(1), rs.getLong(2) }, "Unable to read the WAL layout"));
-        jdbcConnection.commit();
         walBlockSize = layout[0];
         walSegmentSize = layout[1];
     }

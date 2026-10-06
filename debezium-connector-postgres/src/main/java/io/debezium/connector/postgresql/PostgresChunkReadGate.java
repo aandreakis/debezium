@@ -32,7 +32,9 @@ import io.debezium.spi.schema.DataCollectionId;
  * <li>All work of the incremental snapshot runs on the thread that processes the replication stream (the thread that
  * started the incremental snapshot source), so the set of transactions whose changes were emitted is fixed during a
  * read and the snapshot's state has a single writer. A signal handled on another thread, for example from Kafka, JMX
- * or a file, is queued and runs on that thread at its next transaction commit or idle poll, in arrival order.</li>
+ * or a file, is queued and runs on that thread at its next transaction commit or idle poll. Snapshot controls that
+ * arrive on the stream's thread join the same queue, which then runs at once, so controls take effect in arrival
+ * order. A queued request that fails is logged and skipped, as the signal processor does with a failing signal.</li>
  * <li>A chunk is read only when {@link PostgresCommitVisibilityGuard} confirms that every transaction whose changes
  * were emitted and that wrote a table the read can cover is visible to new snapshots. Otherwise the read is put off and retried at a commit or idle poll after
  * 1 s, doubling to 30 s while checks keep failing; any passing check clears the put-off read and resets the delay.
@@ -56,11 +58,22 @@ public class PostgresChunkReadGate {
         void run() throws InterruptedException;
     }
 
+    private static final class Queued {
+        private final String what;
+        private final Work work;
+
+        private Queued(String what, Work work) {
+            this.what = what;
+            this.work = Objects.requireNonNull(work, "work");
+        }
+    }
+
     private final PostgresCommitVisibilityGuard guard;
     private final LongSupplier nanoClock;
-    private final ConcurrentLinkedQueue<Work> queued = new ConcurrentLinkedQueue<>();
+    private final ConcurrentLinkedQueue<Queued> queued = new ConcurrentLinkedQueue<>();
 
     private volatile Thread eventThread;
+    private boolean running;
     private boolean retryPending;
     private long retryNotBeforeNanos;
     private long retryDelayNanos = INITIAL_RETRY_DELAY_NANOS;
@@ -75,12 +88,12 @@ public class PostgresChunkReadGate {
     }
 
     /**
-     * The gate of an incremental snapshot source on the connector's main connection: it tracks transactions on the
-     * tables the connector captures.
+     * The gate of an incremental snapshot source. Its queries run on {@code connection}, a connection of its own, never
+     * the connector's main connection.
      */
     static PostgresChunkReadGate create(RelationalDatabaseConnectorConfig config, PostgresConnection connection) {
         return new PostgresChunkReadGate(new PostgresCommitVisibilityGuard(
-                new JdbcCommitVisibilitySnapshotSource(connection, tableId -> config.getTableFilters().dataCollectionFilter().isIncluded(tableId)),
+                new JdbcCommitVisibilitySnapshotSource(connection),
                 inPlaceWait(config.getSignalProcessorSemaphoreWait())));
     }
 
@@ -116,17 +129,45 @@ public class PostgresChunkReadGate {
      * Queues snapshot work requested on another thread; it runs on the stream's thread at its next commit or idle poll.
      */
     public void queue(String what, Work work) {
-        queued.add(Objects.requireNonNull(work, "work"));
+        queued.add(new Queued(what, work));
         LOGGER.info("Incremental snapshot {} requested outside the replication stream's thread; it runs there at the next commit or idle poll", what);
     }
 
     /**
-     * Runs the queued snapshot work, in arrival order, on the stream's thread.
+     * A snapshot control (start, stop, pause, resume, window close). It joins the queue behind the controls that arrived
+     * before it; on the stream's thread the queue then runs at once, elsewhere at the stream's next commit or idle poll.
+     */
+    public void control(String what, Work work) throws InterruptedException {
+        if (!onEventThread()) {
+            queue(what, work);
+            return;
+        }
+        queued.add(new Queued(what, work));
+        runQueued();
+    }
+
+    /**
+     * Runs the queued snapshot work in arrival order on the stream's thread. A request that fails is logged and
+     * skipped. Work queued while the queue runs, also by the running work itself, runs after it in the same pass.
      */
     public void runQueued() throws InterruptedException {
-        Work work;
-        while ((work = queued.poll()) != null) {
-            work.run();
+        if (running) {
+            return;
+        }
+        running = true;
+        try {
+            Queued next;
+            while ((next = queued.poll()) != null) {
+                try {
+                    next.work.run();
+                }
+                catch (RuntimeException e) {
+                    LOGGER.warn("Incremental snapshot {} failed; the request may not have been processed", next.what, e);
+                }
+            }
+        }
+        finally {
+            running = false;
         }
     }
 

@@ -59,6 +59,10 @@ public class PostgresSignalBasedIncrementalSnapshotChangeEventSource<P extends P
     private final PostgresSchema schema;
     private final PostgresChunkReadGate gate;
 
+    /**
+     * @param visibilityConnection a connection of its own for the commit-visibility check, never the main connection;
+     *            the caller closes it
+     */
     public PostgresSignalBasedIncrementalSnapshotChangeEventSource(RelationalDatabaseConnectorConfig config,
                                                                    JdbcConnection jdbcConnection,
                                                                    EventDispatcher<P, TableId> dispatcher,
@@ -66,9 +70,10 @@ public class PostgresSignalBasedIncrementalSnapshotChangeEventSource<P extends P
                                                                    Clock clock,
                                                                    SnapshotProgressListener<P> progressListener,
                                                                    DataChangeEventListener<P> dataChangeEventListener,
-                                                                   NotificationService<P, ? extends OffsetContext> notificationService) {
+                                                                   NotificationService<P, ? extends OffsetContext> notificationService,
+                                                                   PostgresConnection visibilityConnection) {
         this(config, jdbcConnection, dispatcher, databaseSchema, clock, progressListener, dataChangeEventListener, notificationService,
-                PostgresChunkReadGate.create(config, (PostgresConnection) jdbcConnection));
+                PostgresChunkReadGate.create(config, visibilityConnection));
     }
 
     PostgresSignalBasedIncrementalSnapshotChangeEventSource(RelationalDatabaseConnectorConfig config,
@@ -136,47 +141,38 @@ public class PostgresSignalBasedIncrementalSnapshotChangeEventSource<P extends P
 
     @Override
     public void closeWindow(P partition, String id, OffsetContext offsetContext) throws InterruptedException {
-        if (!gate.onEventThread()) {
-            gate.queue("window close", () -> closeWindow(partition, id, offsetContext));
-            return;
-        }
-        super.closeWindow(partition, id, offsetContext);
+        gate.control("window close", () -> super.closeWindow(partition, id, offsetContext));
     }
 
     @Override
     public void pauseSnapshot(P partition, OffsetContext offsetContext) {
-        if (!gate.onEventThread()) {
-            gate.queue("pause", () -> pauseSnapshot(partition, offsetContext));
-            return;
-        }
-        super.pauseSnapshot(partition, offsetContext);
+        controlWithoutInterrupt("pause", () -> super.pauseSnapshot(partition, offsetContext));
     }
 
     @Override
     public void resumeSnapshot(P partition, OffsetContext offsetContext) throws InterruptedException {
-        if (!gate.onEventThread()) {
-            gate.queue("resume", () -> resumeSnapshot(partition, offsetContext));
-            return;
-        }
-        super.resumeSnapshot(partition, offsetContext);
+        gate.control("resume", () -> super.resumeSnapshot(partition, offsetContext));
     }
 
     @Override
     public void addDataCollectionNamesToSnapshot(SignalPayload<P> signalPayload, SnapshotConfiguration snapshotConfiguration) throws InterruptedException {
-        if (!gate.onEventThread()) {
-            gate.queue("start", () -> addDataCollectionNamesToSnapshot(signalPayload, snapshotConfiguration));
-            return;
-        }
-        super.addDataCollectionNamesToSnapshot(signalPayload, snapshotConfiguration);
+        gate.control("start", () -> super.addDataCollectionNamesToSnapshot(signalPayload, snapshotConfiguration));
     }
 
     @Override
     public void requestStopSnapshot(P partition, OffsetContext offsetContext, Map<String, Object> additionalData, List<String> dataCollectionIds) {
-        if (!gate.onEventThread()) {
-            gate.queue("stop", () -> requestStopSnapshot(partition, offsetContext, additionalData, dataCollectionIds));
-            return;
+        controlWithoutInterrupt("stop", () -> super.requestStopSnapshot(partition, offsetContext, additionalData, dataCollectionIds));
+    }
+
+    /** A control whose caller cannot be interrupted: an interrupt while the queue runs is kept for the thread. */
+    private void controlWithoutInterrupt(String what, PostgresChunkReadGate.Work work) {
+        try {
+            gate.control(what, work);
         }
-        super.requestStopSnapshot(partition, offsetContext, additionalData, dataCollectionIds);
+        catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOGGER.info("Interrupted while running incremental snapshot {}", what);
+        }
     }
 
     @Override

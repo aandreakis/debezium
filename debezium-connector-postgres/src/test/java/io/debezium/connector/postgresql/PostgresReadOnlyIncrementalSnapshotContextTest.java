@@ -52,4 +52,18 @@ public class PostgresReadOnlyIncrementalSnapshotContextTest {
         context.chunkRead(Lsn.valueOf("0/2000"), false);
         assertThat(context.releaseDueWhenIdle(Lsn.valueOf("0/2000"))).as("the next window reaches again").isTrue();
     }
+
+    @Test
+    void aStreamAtAReleasePositionItMustPassWaitsThere() {
+        context.chunkRead(Lsn.valueOf("0/1000"), true);
+
+        assertThat(context.waitsAtReleasePosition(Lsn.valueOf("0/FFF"))).isFalse();
+        assertThat(context.waitsAtReleasePosition(Lsn.valueOf("0/1000"))).isTrue();
+        assertThat(context.waitsAtReleasePosition(null)).isFalse();
+        assertThat(context.waitsAtReleasePosition(Lsn.INVALID_LSN)).isFalse();
+
+        context.releaseWindow();
+        context.chunkRead(Lsn.valueOf("0/2000"), false);
+        assertThat(context.waitsAtReleasePosition(Lsn.valueOf("0/2000"))).as("a position to reach").isFalse();
+    }
 }

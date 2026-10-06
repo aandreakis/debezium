@@ -111,6 +111,21 @@ public class PostgresSignalBasedIncrementalSnapshotChangeEventSourceTest {
     }
 
     @Test
+    void aResumeOnTheStreamsThreadTakesEffectAfterAPauseRequestedEarlierOnAnotherThread() throws Exception {
+        // The resume reads a chunk; the read fails on the connection, as in the test above, which keeps the test short.
+        when(jdbcConnection.commit()).thenThrow(new SQLException("read failed"));
+        runOnAnotherThread(() -> source.pauseSnapshot(null, offsetContext));
+        assertThat(context.isSnapshotPaused()).isFalse();
+
+        source.resumeSnapshot(null, offsetContext);
+
+        assertThat(context.isSnapshotPaused()).as("the earlier pause ran first, then the resume").isFalse();
+        assertThat(guard.checks).as("the resume read a chunk").isEqualTo(1);
+        source.processTransactionCommittedEvent(null, offsetContext);
+        assertThat(context.isSnapshotPaused()).as("no pause left in the queue").isFalse();
+    }
+
+    @Test
     void aRowChangedAfterTheReadIsDroppedBeforeTheOpenMarkerComesBack() {
         source.bufferRow();
         assertThat(source.bufferedRows()).isEqualTo(1);

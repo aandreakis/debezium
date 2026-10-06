@@ -58,15 +58,15 @@ public class PostgresCommitVisibilityGuardTest {
     }
 
     @Test
-    void startOnAPrimaryTracksTheRunningWritersOfCapturedTablesThatAreNotVisible() {
+    void startOnAPrimaryTracksTheRunningWritersThatAreNotVisible() {
         source.idle = "990:1000:991,995,997";
         source.writers = writersOn(A, 991L, 995L, 999L);
 
         guard.start();
 
         assertThat(guard.mode()).isEqualTo(Mode.PRIMARY);
-        assertThat(source.calls).containsExactly("state", "writers");
-        assertThat(guard.trackedIds()).as("997 wrote no captured table; 999 is finished in the snapshot").containsExactlyInAnyOrder(991L, 995L);
+        assertThat(source.calls).containsExactly("state", "descendants", "writers");
+        assertThat(guard.trackedIds()).as("997 holds no write lock; 999 is finished in the snapshot").containsExactlyInAnyOrder(991L, 995L);
     }
 
     @Test
@@ -110,7 +110,7 @@ public class PostgresCommitVisibilityGuardTest {
         assertThat(guard.awaitVisible(null)).isTrue();
 
         assertThat(guard.mode()).isEqualTo(Mode.PRIMARY);
-        assertThat(source.calls).startsWith("state", "writers", "state");
+        assertThat(source.calls).startsWith("state", "descendants", "writers", "state");
         assertThat(clock.sleeps).as("waited for the captured writer").isNotEmpty();
     }
 
@@ -260,7 +260,7 @@ public class PostgresCommitVisibilityGuardTest {
         source.calls.clear();
 
         assertThat(guard.awaitVisible(null)).isTrue();
-        assertThat(source.calls).startsWith("state", "writers", "state");
+        assertThat(source.calls).startsWith("state", "descendants", "writers", "state");
         assertThat(guard.mode()).isEqualTo(Mode.PRIMARY);
         assertThat(clock.sleeps).as("waited for both captured writers").isNotEmpty();
     }
@@ -364,6 +364,27 @@ public class PostgresCommitVisibilityGuardTest {
     }
 
     @Test
+    void aReadOfATableWithDescendantsWaitsForEveryTrackedTransaction() throws Exception {
+        final TableId parent = new TableId(null, "inventory", "parent");
+        final TableId partition = new TableId(null, "inventory", "parent_2026");
+        source.idle = "990:1000:991,995";
+        source.writers = writersOn(partition, 991L);
+        source.descendants = Set.of(parent);
+        guard.start();
+        guard.recordEmitted(995L, B);
+
+        assertThat(guard.awaitVisible(Set.of(A))).as("no tracked transaction wrote a").isTrue();
+        assertThat(guard.awaitVisible(Set.of(parent))).as("991 wrote a partition, whose changes can carry the parent's name").isFalse();
+
+        source.idle = "992:1000:995";
+        assertThat(guard.awaitVisible(Set.of(A, parent))).as("995 wrote b only, but every tracked transaction counts").isFalse();
+        assertThat(guard.awaitVisible(Set.of(A))).isTrue();
+
+        source.idle = "996:1000:";
+        assertThat(guard.awaitVisible(Set.of(parent))).isTrue();
+    }
+
+    @Test
     void theStuckRuleCountsOnlyTransactionsOfTheReadsTables() throws Exception {
         source.idle = "100:200:150,160";
         guard.start();
@@ -424,6 +445,7 @@ public class PostgresCommitVisibilityGuardTest {
         String idle = "1:1:";
         boolean inRecovery;
         Map<Long, Set<TableId>> writers = Map.of();
+        Set<TableId> descendants = Set.of();
         SQLException failNextState;
 
         void snapshots(String... snapshots) {
@@ -443,9 +465,15 @@ public class PostgresCommitVisibilityGuardTest {
         }
 
         @Override
-        public Map<Long, Set<TableId>> runningWritersOfCapturedTables() {
+        public Map<Long, Set<TableId>> runningWriters() {
             calls.add("writers");
             return writers;
+        }
+
+        @Override
+        public Set<TableId> tablesWithDescendants() {
+            calls.add("descendants");
+            return descendants;
         }
     }
 

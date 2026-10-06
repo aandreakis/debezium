@@ -82,6 +82,7 @@ public class PostgresConnectorTask extends BaseSourceTask<PostgresPartition, Pos
     private volatile ChangeEventQueue<DataChangeEvent> queue;
     private volatile PostgresConnection jdbcConnection;
     private volatile PostgresConnection beanRegistryJdbcConnection;
+    private volatile PostgresConnection visibilityJdbcConnection;
     private volatile ReplicationConnection replicationConnection = null;
 
     private volatile ErrorHandler errorHandler;
@@ -159,6 +160,8 @@ public class PostgresConnectorTask extends BaseSourceTask<PostgresPartition, Pos
 
         // Manual Bean Registration
         beanRegistryJdbcConnection = connectionFactory.newConnection();
+        // Opened on first use, by an incremental snapshot's commit-visibility check.
+        visibilityJdbcConnection = new PostgresConnection(connectorConfig.getJdbcConfig(), PostgresConnection.CONNECTION_COMMIT_VISIBILITY);
         connectorConfig.getBeanRegistry().add(StandardBeanNames.CONFIGURATION, config);
         connectorConfig.getBeanRegistry().add(StandardBeanNames.CONNECTOR_CONFIG, connectorConfig);
         connectorConfig.getBeanRegistry().add(StandardBeanNames.DATABASE_SCHEMA, schema);
@@ -281,7 +284,8 @@ public class PostgresConnectorTask extends BaseSourceTask<PostgresPartition, Pos
                             taskContext,
                             replicationConnection,
                             slotCreatedInfo,
-                            slotInfo),
+                            slotInfo,
+                            visibilityJdbcConnection),
                     new PostgresChangeEventSourceMetricsFactory(),
                     dispatcher,
                     schema,
@@ -435,6 +439,15 @@ public class PostgresConnectorTask extends BaseSourceTask<PostgresPartition, Pos
         }
         catch (Exception e) {
             LOGGER.trace("Error while closing JDBC bean registry connection", e);
+        }
+
+        try {
+            if (visibilityJdbcConnection != null) {
+                visibilityJdbcConnection.close();
+            }
+        }
+        catch (Exception e) {
+            LOGGER.trace("Error while closing JDBC commit visibility connection", e);
         }
 
         if (jdbcConnection != null) {

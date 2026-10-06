@@ -24,7 +24,8 @@ import io.debezium.pipeline.source.snapshot.incremental.AbstractIncrementalSnaps
  * The window is released at the first processed commit whose position (the end of its commit record) is at or after
  * the release position, or on an idle stream once the server's sent position reaches it. When the release position is
  * a standby's replay position, the commit record of a transaction the query saw may still be in replay and end after
- * it; the stream must then pass the release position, not just reach it.
+ * it; the stream must then pass the release position, not just reach it, unless the source shows that no record was
+ * left in replay ({@link #waitsAtReleasePosition(Lsn)}).
  *
  * @author Mario Fiore Vitale
  */
@@ -77,6 +78,15 @@ public class PostgresReadOnlyIncrementalSnapshotContext<T> extends AbstractIncre
      */
     public boolean releaseDueWhenIdle(Lsn serverPosition) {
         return reached(serverPosition);
+    }
+
+    /**
+     * Whether the stream has reached, but must pass, the release position: on an idle standby the source can then
+     * release the window once it sees that no record was left in replay.
+     */
+    public boolean waitsAtReleasePosition(Lsn serverPosition) {
+        return windowOpened && mustPass && releasePosition != null && serverPosition != null && serverPosition.isValid()
+                && serverPosition.compareTo(releasePosition) >= 0;
     }
 
     private boolean reached(Lsn streamPosition) {

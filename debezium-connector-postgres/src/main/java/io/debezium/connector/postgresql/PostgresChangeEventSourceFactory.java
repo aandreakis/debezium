@@ -38,13 +38,18 @@ public class PostgresChangeEventSourceFactory implements ChangeEventSourceFactor
     private final ReplicationConnection replicationConnection;
     private final SlotCreationResult slotCreatedInfo;
     private final SlotState startingSlotInfo;
+    private final PostgresConnection visibilityConnection;
     private volatile PostgresStreamingChangeEventSource streamingSource;
 
+    /**
+     * @param visibilityConnection a connection of its own for the incremental snapshot's commit-visibility check; the
+     *            caller closes it
+     */
     public PostgresChangeEventSourceFactory(PostgresConnectorConfig configuration, SnapshotterService snapshotterService,
                                             MainConnectionProvidingConnectionFactory<PostgresConnection> connectionFactory,
                                             ErrorHandler errorHandler, PostgresEventDispatcher<TableId> dispatcher, Clock clock, PostgresSchema schema,
                                             PostgresTaskContext taskContext, ReplicationConnection replicationConnection, SlotCreationResult slotCreatedInfo,
-                                            SlotState startingSlotInfo) {
+                                            SlotState startingSlotInfo, PostgresConnection visibilityConnection) {
         this.configuration = configuration;
         this.connectionFactory = connectionFactory;
         this.errorHandler = errorHandler;
@@ -56,6 +61,7 @@ public class PostgresChangeEventSourceFactory implements ChangeEventSourceFactor
         this.replicationConnection = replicationConnection;
         this.slotCreatedInfo = slotCreatedInfo;
         this.startingSlotInfo = startingSlotInfo;
+        this.visibilityConnection = visibilityConnection;
     }
 
     @Override
@@ -110,7 +116,8 @@ public class PostgresChangeEventSourceFactory implements ChangeEventSourceFactor
                     () -> {
                         final PostgresStreamingChangeEventSource streaming = streamingSource;
                         return streaming == null ? null : streaming.lastServerPosition();
-                    }));
+                    },
+                    visibilityConnection));
         }
 
         // If no data collection id is provided, don't return an instance as the implementation requires
@@ -127,6 +134,7 @@ public class PostgresChangeEventSourceFactory implements ChangeEventSourceFactor
                 clock,
                 snapshotProgressListener,
                 dataChangeEventListener,
-                notificationService));
+                notificationService,
+                visibilityConnection));
     }
 }
