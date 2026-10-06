@@ -5,6 +5,9 @@
  */
 package io.debezium.pipeline.source.snapshot.incremental;
 
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
@@ -94,6 +97,25 @@ public class AbstractIncrementalSnapshotChangeEventSourceTest {
         source.readChunk(null, offsetContext);
 
         verify(jdbcConnection, never()).close();
+    }
+
+    @Test
+    public void shouldOpenNoWindowWhenTheConnectorDefersTheRead() throws Exception {
+        SignalBasedIncrementalSnapshotChangeEventSource<TestPartition, TableId> deferring = new SignalBasedIncrementalSnapshotChangeEventSource<>(config(),
+                jdbcConnection, null, null, null, progressListener, null, notificationService) {
+            @Override
+            protected boolean isReadyForChunkRead(TestPartition partition, OffsetContext offsetContext) {
+                return false;
+            }
+        };
+
+        deferring.readChunk(null, offsetContext);
+
+        // No commit, no open marker, no new chunk: the progress stays as it was.
+        verify(jdbcConnection, never()).commit();
+        verify(jdbcConnection, never()).prepareUpdate(anyString(), any());
+        assertThat(offsetContext.getIncrementalSnapshotContext().currentChunkId()).isNull();
+        assertThat(offsetContext.getIncrementalSnapshotContext().snapshotRunning()).isTrue();
     }
 
     private RelationalDatabaseConnectorConfig config() {

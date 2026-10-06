@@ -260,6 +260,10 @@ public abstract class AbstractIncrementalSnapshotChangeEventSource<P extends Par
         }
         try {
             preReadChunk(context);
+            if (!isReadyForChunkRead(partition, offsetContext)) {
+                LOGGER.debug("Chunk read deferred by the connector, the window is not opened");
+                return;
+            }
             // This commit should be unnecessary and might be removed later
             jdbcConnection.commit();
             context.startNewChunk();
@@ -862,6 +866,16 @@ public abstract class AbstractIncrementalSnapshotChangeEventSource<P extends Par
         catch (SQLException e) {
             throw new DebeziumException("Database error while checking jdbcConnection in preReadChunk", e);
         }
+    }
+
+    /**
+     * Called by {@link #readChunk} after {@link #preReadChunk} and before the window is opened. A connector returns
+     * {@code false} to defer the read: no window is opened, no query runs and the snapshot progress stays as it is.
+     * The connector is then responsible for calling {@link #readChunk} again later. Implementations must not throw.
+     * The default always reads.
+     */
+    protected boolean isReadyForChunkRead(P partition, OffsetContext offsetContext) {
+        return true;
     }
 
     protected void postReadChunk(IncrementalSnapshotContext<T> context) {
