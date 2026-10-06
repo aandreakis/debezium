@@ -7,7 +7,10 @@ package io.debezium.connector.postgresql;
 
 import java.sql.SQLException;
 import java.time.Duration;
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
@@ -16,8 +19,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.connector.postgresql.connection.PostgresConnection;
+import io.debezium.pipeline.source.snapshot.incremental.DataCollection;
+import io.debezium.pipeline.source.snapshot.incremental.IncrementalSnapshotContext;
 import io.debezium.pipeline.spi.OffsetContext;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
+import io.debezium.relational.TableId;
+import io.debezium.spi.schema.DataCollectionId;
 
 /**
  * Decides when the PostgreSQL incremental snapshot may read a chunk.
@@ -27,7 +34,7 @@ import io.debezium.relational.RelationalDatabaseConnectorConfig;
  * read and the snapshot's state has a single writer. A signal handled on another thread, for example from Kafka, JMX
  * or a file, is queued and runs on that thread at its next transaction commit or idle poll, in arrival order.</li>
  * <li>A chunk is read only when {@link PostgresCommitVisibilityGuard} confirms that every transaction whose changes
- * were emitted is visible to new snapshots. Otherwise the read is put off and retried at a commit or idle poll after
+ * were emitted and that wrote a table the read can cover is visible to new snapshots. Otherwise the read is put off and retried at a commit or idle poll after
  * 1 s, doubling to 30 s while checks keep failing; any passing check clears the put-off read and resets the delay.
  * Streaming continues in between.</li>
  * </ul>
@@ -127,10 +134,10 @@ public class PostgresChunkReadGate {
      * Called right before a chunk read opens its window, on the stream's thread. Returns whether the read may run; if
      * not, the read is put off and {@link #retryDue()} reports when to try again. Never throws.
      */
-    public boolean readyForChunkRead() {
+    public boolean readyForChunkRead(Collection<TableId> readTables) {
         boolean visible;
         try {
-            visible = guard.awaitVisible();
+            visible = guard.awaitVisible(readTables);
         }
         catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -168,11 +175,21 @@ public class PostgresChunkReadGate {
         return true;
     }
 
-    /** Records the transaction of an emitted change. */
-    public void recordEmitted(OffsetContext offsetContext) {
+    /** Records the transaction of an emitted change and the change's table. */
+    public void recordEmitted(OffsetContext offsetContext, DataCollectionId dataCollectionId) {
         if (offsetContext instanceof PostgresOffsetContext) {
-            guard.recordEmitted(((PostgresOffsetContext) offsetContext).transactionId());
+            guard.recordEmitted(((PostgresOffsetContext) offsetContext).transactionId(),
+                    dataCollectionId instanceof TableId ? (TableId) dataCollectionId : null);
         }
+    }
+
+    /** The tables a chunk read of the given snapshot can cover: the current one and those that follow. */
+    public static Set<TableId> tablesLeft(IncrementalSnapshotContext<TableId> context) {
+        final Set<TableId> tablesLeft = new HashSet<>();
+        for (DataCollection<TableId> dataCollection : context.getDataCollections()) {
+            tablesLeft.add(dataCollection.getId());
+        }
+        return tablesLeft;
     }
 
     /** A transaction's commit was processed. */

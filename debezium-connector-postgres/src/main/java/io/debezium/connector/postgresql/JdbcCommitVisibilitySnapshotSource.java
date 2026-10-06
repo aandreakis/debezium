@@ -7,7 +7,9 @@ package io.debezium.connector.postgresql;
 
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Predicate;
@@ -50,12 +52,13 @@ public class JdbcCommitVisibilitySnapshotSource implements PostgresCommitVisibil
     }
 
     @Override
-    public Set<Long> runningWritersOfCapturedTables() throws SQLException {
+    public Map<Long, Set<TableId>> runningWritersOfCapturedTables() throws SQLException {
         return inOwnTransaction(() -> connection.queryAndMap(RUNNING_WRITERS, rs -> {
-            final Set<Long> writers = new HashSet<>();
+            final Map<Long, Set<TableId>> writers = new HashMap<>();
             while (rs.next()) {
-                if (capturedTable.test(new TableId(null, rs.getString(2), rs.getString(3)))) {
-                    writers.add(rs.getLong(1));
+                final TableId table = new TableId(null, rs.getString(2), rs.getString(3));
+                if (capturedTable.test(table)) {
+                    writers.computeIfAbsent(rs.getLong(1), id -> new HashSet<>()).add(table);
                 }
             }
             return writers;

@@ -146,7 +146,8 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
 
     @Override
     protected boolean isReadyForChunkRead(P partition, OffsetContext offsetContext) {
-        return gate.readyForChunkRead();
+        // A read can move on to the next tables of the snapshot within the same window, so all of them count.
+        return gate.readyForChunkRead(PostgresChunkReadGate.tablesLeft(context));
     }
 
     @Override
@@ -235,7 +236,7 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
             LOGGER.warn("Context is null, skipping message processing");
             return;
         }
-        gate.recordEmitted(offsetContext);
+        gate.recordEmitted(offsetContext, dataCollectionId);
         if (!window.isEmpty()) {
             LOGGER.trace("Deduplicating");
             deduplicateWindow(dataCollectionId, key);

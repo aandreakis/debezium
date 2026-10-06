@@ -14,6 +14,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.sql.SQLException;
+import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -65,6 +66,7 @@ public class PostgresSignalBasedIncrementalSnapshotChangeEventSourceTest {
 
         assertThat(guard.checks).isEqualTo(1);
         assertThat(guard.checkThread).isSameAs(Thread.currentThread());
+        assertThat(guard.readTables).as("the current table and those that follow").containsExactlyInAnyOrder(TableId.parse("public.a"), TableId.parse("public.b"));
     }
 
     @Test
@@ -141,11 +143,13 @@ public class PostgresSignalBasedIncrementalSnapshotChangeEventSourceTest {
         int checks;
         boolean visible = true;
         Thread checkThread;
+        Collection<TableId> readTables;
 
         @Override
-        public boolean awaitVisible() {
+        public boolean awaitVisible(Collection<TableId> readTables) {
             checks++;
             checkThread = Thread.currentThread();
+            this.readTables = readTables;
             return visible;
         }
     }

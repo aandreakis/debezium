@@ -107,7 +107,7 @@ public class PostgresSignalBasedIncrementalSnapshotChangeEventSource<P extends P
             LOGGER.warn("Context is null, skipping message processing");
             return;
         }
-        gate.recordEmitted(offsetContext);
+        gate.recordEmitted(offsetContext, dataCollectionId);
         // A non-empty window means a chunk was read and not yet sent. Every event processed after the read removes the
         // row with the same key, also before the open marker comes back through the stream.
         if (!window.isEmpty()) {
@@ -117,7 +117,8 @@ public class PostgresSignalBasedIncrementalSnapshotChangeEventSource<P extends P
 
     @Override
     protected boolean isReadyForChunkRead(P partition, OffsetContext offsetContext) {
-        return gate.readyForChunkRead();
+        // A read can move on to the next tables of the snapshot within the same window, so all of them count.
+        return gate.readyForChunkRead(PostgresChunkReadGate.tablesLeft(context));
     }
 
     @Override

@@ -11,14 +11,18 @@ import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Deque;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.junit.jupiter.api.Test;
+
+import io.debezium.relational.TableId;
 
 public class PostgresChunkReadGateTest {
 
@@ -42,7 +46,7 @@ public class PostgresChunkReadGateTest {
         long[] expectedDelays = { 1, 2, 4, 8, 16, 30, 30 };
         for (long delaySeconds : expectedDelays) {
             guard.results.add(false);
-            assertThat(gate.readyForChunkRead()).isFalse();
+            assertThat(gate.readyForChunkRead(null)).isFalse();
             assertThat(gate.isRetryPending()).isTrue();
             long failedAt = clock.get();
             clock.set(failedAt + delaySeconds * SECOND - 1);
@@ -53,9 +57,9 @@ public class PostgresChunkReadGateTest {
         }
 
         guard.results.add(true);
-        assertThat(gate.readyForChunkRead()).isTrue();
+        assertThat(gate.readyForChunkRead(null)).isTrue();
         guard.results.add(false);
-        assertThat(gate.readyForChunkRead()).isFalse();
+        assertThat(gate.readyForChunkRead(null)).isFalse();
         clock.addAndGet(SECOND);
         assertThat(gate.retryDue()).as("the delay restarted at 1 s").isTrue();
     }
@@ -63,12 +67,12 @@ public class PostgresChunkReadGateTest {
     @Test
     void aPassingCheckClearsAPutOffReadSoItIsNotReadAgain() {
         guard.results.add(false);
-        assertThat(gate.readyForChunkRead()).isFalse();
+        assertThat(gate.readyForChunkRead(null)).isFalse();
         assertThat(gate.isRetryPending()).isTrue();
 
         // A resume signal reads before the retry is due, and the check passes.
         guard.results.add(true);
-        assertThat(gate.readyForChunkRead()).isTrue();
+        assertThat(gate.readyForChunkRead(null)).isTrue();
 
         clock.addAndGet(60 * SECOND);
         assertThat(gate.isRetryPending()).isFalse();
@@ -79,7 +83,7 @@ public class PostgresChunkReadGateTest {
     void aFailingQueryPutsTheReadOff() {
         guard.failure = new SQLException("connection lost");
 
-        assertThat(gate.readyForChunkRead()).isFalse();
+        assertThat(gate.readyForChunkRead(null)).isFalse();
         assertThat(gate.isRetryPending()).isTrue();
     }
 
@@ -87,7 +91,7 @@ public class PostgresChunkReadGateTest {
     void anInterruptPutsTheReadOffAndKeepsTheInterruptFlag() {
         guard.interrupt = true;
         try {
-            assertThat(gate.readyForChunkRead()).isFalse();
+            assertThat(gate.readyForChunkRead(null)).isFalse();
             assertThat(Thread.currentThread().isInterrupted()).isTrue();
         }
         finally {
@@ -138,7 +142,7 @@ public class PostgresChunkReadGateTest {
     @Test
     void theEndOfASnapshotDropsAPutOffRead() {
         guard.results.add(false);
-        assertThat(gate.readyForChunkRead()).isFalse();
+        assertThat(gate.readyForChunkRead(null)).isFalse();
 
         gate.snapshotEnded();
 
@@ -156,8 +160,8 @@ public class PostgresChunkReadGateTest {
                 }
 
                 @Override
-                public Set<Long> runningWritersOfCapturedTables() {
-                    return Set.of();
+                public Map<Long, Set<TableId>> runningWritersOfCapturedTables() {
+                    return Map.of();
                 }
             }, Duration.ofSeconds(5));
         }
@@ -176,7 +180,7 @@ public class PostgresChunkReadGateTest {
         }
 
         @Override
-        public boolean awaitVisible() throws SQLException, InterruptedException {
+        public boolean awaitVisible(Collection<TableId> readTables) throws SQLException, InterruptedException {
             if (failure != null) {
                 throw failure;
             }
