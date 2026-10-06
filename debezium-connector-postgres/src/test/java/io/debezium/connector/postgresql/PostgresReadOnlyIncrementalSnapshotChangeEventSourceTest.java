@@ -10,6 +10,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Field;
@@ -25,7 +26,6 @@ import org.junit.jupiter.api.Test;
 
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.doc.FixFor;
-import io.debezium.jdbc.JdbcConnection;
 import io.debezium.pipeline.notification.NotificationService;
 import io.debezium.pipeline.source.spi.SnapshotProgressListener;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
@@ -70,7 +70,7 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSourceTest {
         final AtomicLong clock = new AtomicLong();
         final PostgresChunkReadGate gate = new PostgresChunkReadGate(new PostgresChunkReadGateTest.ScriptedGuardBase(), clock::get);
         final PostgresConnection connection = mock(PostgresConnection.class);
-        when(connection.queryAndMap(anyString(), any(JdbcConnection.ResultSetMapper.class))).thenThrow(new SQLException("connection lost"));
+        when(connection.queryAndMap(anyString(), any())).thenThrow(new SQLException("connection lost"));
         final TestSource source = new TestSource(connection, gate);
         final PostgresReadOnlyIncrementalSnapshotContext<TableId> context = new PostgresReadOnlyIncrementalSnapshotContext<>();
         context.addDataCollectionNamesToSnapshot("signal-1", List.of("public.a"), List.of(), "");
@@ -81,6 +81,7 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSourceTest {
 
         source.emitWindowClose(null, null);
 
+        verify(connection).queryAndMap(anyString(), any());
         assertThat(source.bufferedRows()).isZero();
         assertThat(context.isWindowOpen()).isFalse();
         assertThat(context.chunkEndPosititon()).as("the chunk is read again from the last row sent").containsExactly(0);
