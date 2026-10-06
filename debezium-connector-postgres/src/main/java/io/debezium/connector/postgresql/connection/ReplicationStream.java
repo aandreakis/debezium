@@ -76,8 +76,9 @@ public interface ReplicationStream extends AutoCloseable {
 
     /**
      * Returns how far the server has sent the stream, as far as this client has read it: the position of the last data
-     * message read, or the server's sent position from the last keepalive read, whichever is later. Every transaction
-     * that commits before this position has been read. Call it from the thread that reads the stream.
+     * message read, or the server's sent position from the last keepalive read, whichever was read last. It can move
+     * backwards when a data message follows a keepalive. Every transaction whose commit record ends at or before this
+     * position has been read. Call it from the thread that reads the stream.
      *
      * @return the position, possibly null if this is called before anything has been read
      */
