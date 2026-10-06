@@ -190,6 +190,7 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
             return;
         }
         super.readChunk(partition, offsetContext);
+        gate.afterChunkRead(getContext() != null && getContext().snapshotRunning() && !getContext().isSnapshotPaused() && !getContext().isWindowOpen());
     }
 
     @Override
@@ -257,6 +258,10 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
             return;
         }
         gate.recordEmitted(offsetContext, dataCollectionId);
+        if (gate.hasQueued()) {
+            // Requests from other threads run before this event is compared, so they wait for no commit.
+            gate.runQueued();
+        }
         if (!window.isEmpty()) {
             LOGGER.trace("Deduplicating");
             deduplicateWindow(dataCollectionId, key);

@@ -32,11 +32,12 @@ import io.debezium.spi.schema.DataCollectionId;
  * <li>All work of the incremental snapshot runs on the thread that processes the replication stream (the thread that
  * started the incremental snapshot source), so the set of transactions whose changes were emitted is fixed during a
  * read and the snapshot's state has a single writer. A signal handled on another thread, for example from Kafka, JMX
- * or a file, is queued and runs on that thread at its next transaction commit or idle poll. Snapshot controls that
+ * or a file, is queued and runs on that thread before its next event, commit or idle poll. Snapshot controls that
  * arrive on the stream's thread join the same queue, which then runs at once, so controls run in arrival order. A stop
  * request is recorded and, as in stock Debezium, applied by the shared code at the next chunk read. A queued request
  * that fails is logged and skipped, as the signal processor does with a failing signal, and a chunk read is retried
- * later.</li>
+ * later. Queued work lives in memory only, like Debezium's synchronous signals: a request taken from its channel but
+ * not yet run when the task stops is lost.</li>
  * <li>A chunk is read only when {@link PostgresCommitVisibilityGuard} confirms that every transaction whose changes
  * were emitted and that wrote a table the read can cover is visible to new snapshots. Otherwise the read is put off and retried at a commit or idle poll after
  * 1 s, doubling to 30 s while checks keep failing; any passing check clears the put-off read and resets the delay.
@@ -213,6 +214,21 @@ public class PostgresChunkReadGate {
         retryPending = true;
         retryNotBeforeNanos = nanoClock.getAsLong() + retryDelayNanos;
         retryDelayNanos = Math.min(retryDelayNanos * 2, MAX_RETRY_DELAY_NANOS);
+    }
+
+    /**
+     * After a chunk read on the stream's thread. When the read left the snapshot running with no window and no read put
+     * off, as after a failed read that the shared code skipped, a read is retried later so the snapshot moves on.
+     */
+    public void afterChunkRead(boolean runningWithoutWindow) {
+        if (runningWithoutWindow && !retryPending) {
+            retryLater();
+        }
+    }
+
+    /** Whether snapshot work is queued for the stream's thread. */
+    public boolean hasQueued() {
+        return !queued.isEmpty();
     }
 
     /** Whether a put-off chunk read is due now; clears it when it is. */

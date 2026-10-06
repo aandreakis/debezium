@@ -80,24 +80,33 @@ public class PostgresSignalBasedIncrementalSnapshotChangeEventSourceTest {
     }
 
     @Test
-    void aPutOffReadIsNotRetriedAfterAResumeReadPassedItsCheck() throws Exception {
+    void aFailedReadIsRetriedSoTheRestOfTheSnapshotMovesOn() throws Exception {
         guard.visible = false;
         source.readChunk(null, offsetContext);
         assertThat(guard.checks).isEqualTo(1);
 
         // The snapshot is paused and resumed before the retry is due; the resume reads and its check passes. The read
-        // then fails on the connection and skips the first table, so the snapshot keeps running with the second.
+        // then fails on the connection, and the shared code skips the first table without opening a window.
         when(jdbcConnection.commit()).thenThrow(new SQLException("read failed"));
         source.pauseSnapshot(null, offsetContext);
         guard.visible = true;
         source.resumeSnapshot(null, offsetContext);
         assertThat(guard.checks).isEqualTo(2);
+        assertThat(context.snapshotRunning()).as("the second table is left").isTrue();
 
-        assertThat(context.snapshotRunning()).isTrue();
-
-        clock.addAndGet(60_000_000_000L);
+        clock.addAndGet(1_000_000_000L);
         source.processTransactionCommittedEvent(null, offsetContext);
-        assertThat(guard.checks).as("the passing check cleared the put-off read").isEqualTo(2);
+        assertThat(guard.checks).as("the second table is read after the retry delay").isEqualTo(3);
+    }
+
+    @Test
+    void aRequestQueuedOnAnotherThreadRunsBeforeTheStreamsNextEvent() throws Exception {
+        runOnAnotherThread(() -> source.pauseSnapshot(null, offsetContext));
+        assertThat(context.isSnapshotPaused()).isFalse();
+
+        source.processMessage(null, context.currentDataCollectionId().getId(), TestSource.key(7), offsetContext);
+
+        assertThat(context.isSnapshotPaused()).as("no commit or idle poll needed").isTrue();
     }
 
     @Test

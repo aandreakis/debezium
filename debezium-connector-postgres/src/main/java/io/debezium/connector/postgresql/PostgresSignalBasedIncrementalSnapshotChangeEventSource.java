@@ -113,6 +113,10 @@ public class PostgresSignalBasedIncrementalSnapshotChangeEventSource<P extends P
             return;
         }
         gate.recordEmitted(offsetContext, dataCollectionId);
+        if (gate.hasQueued()) {
+            // Requests from other threads run before this event is compared, so they wait for no commit.
+            runQueuedWithoutInterrupt();
+        }
         // A non-empty window means a chunk was read and not yet sent. Every event processed after the read removes the
         // row with the same key, also before the open marker comes back through the stream.
         if (!window.isEmpty()) {
@@ -137,6 +141,7 @@ public class PostgresSignalBasedIncrementalSnapshotChangeEventSource<P extends P
             return;
         }
         super.readChunk(partition, offsetContext);
+        gate.afterChunkRead(context != null && context.snapshotRunning() && !context.isSnapshotPaused() && window.isEmpty());
     }
 
     @Override
@@ -162,6 +167,15 @@ public class PostgresSignalBasedIncrementalSnapshotChangeEventSource<P extends P
     @Override
     public void requestStopSnapshot(P partition, OffsetContext offsetContext, Map<String, Object> additionalData, List<String> dataCollectionIds) {
         controlWithoutInterrupt("stop", () -> super.requestStopSnapshot(partition, offsetContext, additionalData, dataCollectionIds));
+    }
+
+    private void runQueuedWithoutInterrupt() {
+        try {
+            gate.runQueued();
+        }
+        catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /** A control whose caller cannot be interrupted: an interrupt while the queue runs is kept for the thread. */

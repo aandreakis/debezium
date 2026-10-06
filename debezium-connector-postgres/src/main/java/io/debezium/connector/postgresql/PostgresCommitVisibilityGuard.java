@@ -48,12 +48,13 @@ import io.debezium.relational.TableId;
  * tracks the transactions that hold a write lock on a table of the current database and that the snapshot does not
  * show finished, each with its tables and their ancestors: a transaction that wrote only a partition locks only the
  * partition, while its change can be emitted under the partitioned table's name ({@code publish.via.partition.root}).
- * The ancestors read at the capture stay complete while such a transaction runs: attaching a table as a partition
- * takes an ACCESS EXCLUSIVE lock on it and on all its partitions.</li>
+ * A partition's ancestors read at the capture stay complete while such a transaction runs: attaching a table as a
+ * partition takes an ACCESS EXCLUSIVE lock on it and on all its partitions. (Ordinary inheritance gives no such
+ * guarantee, but a change to an inheritance child is never published under the parent's name.)</li>
  * <li><b>Check.</b> The guard prunes the tracked set with a new snapshot and, if transactions that wrote one of the
  * read's tables remain, polls new snapshots (every 1 ms, doubling to every 50 ms) for at most {@code maxWait} without
  * processing events, so the set can only shrink. Such a transaction pending longer than {@code maxWait} makes the check
- * fail at once.</li>
+ * fail at once. {@code maxWait} is a polling budget: it does not bound the time of the queries themselves.</li>
  * </ul>
  * On a standby there is no gap: a transaction becomes visible when its commit record is replayed, before logical
  * decoding on the standby can read it. The guard then tracks nothing, and every check asks whether the server is still
@@ -404,7 +405,7 @@ public class PostgresCommitVisibilityGuard {
             failureLogged = true;
             failureLoggedAtNanos = now;
             LOGGER.warn(
-                    "Incremental snapshot chunk read deferred: {} transaction(s) that wrote the snapshot's tables, and whose changes were already emitted, are not yet visible to new snapshots{}; "
+                    "Incremental snapshot chunk read deferred: {} transaction(s) that wrote the snapshot's tables, emitted or holding write locks when tracking started, are not yet visible to new snapshots{}; "
                             + "oldest pending: {} (consecutive failed checks: {})",
                     relevantCount(readTables),
                     stuck ? ", one of them for longer than " + TimeUnit.NANOSECONDS.toMillis(maxWaitNanos) + " ms" : "",

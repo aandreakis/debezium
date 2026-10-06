@@ -225,6 +225,32 @@ public class PostgresChunkReadGateTest {
     }
 
     @Test
+    void aReadThatLeftTheSnapshotWithoutAWindowIsRetried() {
+        gate.afterChunkRead(true);
+
+        assertThat(gate.isRetryPending()).isTrue();
+        assertThat(gate.retryDue()).isFalse();
+        clock.addAndGet(SECOND);
+        assertThat(gate.retryDue()).isTrue();
+
+        gate.afterChunkRead(false);
+        assertThat(gate.isRetryPending()).as("a read with a window needs no retry").isFalse();
+    }
+
+    @Test
+    void aPutOffReadKeepsItsDelayAfterTheRead() {
+        guard.results.add(false);
+        assertThat(gate.readyForChunkRead(null)).isFalse();
+
+        gate.afterChunkRead(true);
+
+        clock.addAndGet(SECOND - 1);
+        assertThat(gate.retryDue()).isFalse();
+        clock.addAndGet(1);
+        assertThat(gate.retryDue()).isTrue();
+    }
+
+    @Test
     void anUnboundGateTreatsEveryThreadAsTheStreamsThread() {
         assertThat(gate.onEventThread()).isTrue();
     }
