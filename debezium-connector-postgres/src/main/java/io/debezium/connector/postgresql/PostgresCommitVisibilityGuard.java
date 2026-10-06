@@ -62,6 +62,12 @@ import io.debezium.relational.TableId;
  * <p>
  * When a query of the guard fails, the guard forgets what it tracked and captures again before the next check.
  * <p>
+ * After a capture, a transaction that wrote a table of the snapshot and is still open, for example a session idle in
+ * transaction or a prepared transaction, holds the chunk reads of that table, and of the tables before it in the
+ * snapshot, until it ends, even if none of its changes was emitted. The deferral warning names its id: the low 32 bits
+ * match {@code backend_xid} in {@code pg_stat_activity} and {@code transaction} in {@code pg_prepared_xacts}. An orphaned
+ * prepared transaction holds them until it is resolved with {@code COMMIT PREPARED} or {@code ROLLBACK PREPARED}.
+ * <p>
  * Not thread-safe: used only by the thread that processes the replication stream.
  */
 @NotThreadSafe
@@ -406,7 +412,7 @@ public class PostgresCommitVisibilityGuard {
             failureLoggedAtNanos = now;
             LOGGER.warn(
                     "Incremental snapshot chunk read deferred: {} transaction(s) that wrote the snapshot's tables, emitted or holding write locks when tracking started, are not yet visible to new snapshots{}; "
-                            + "oldest pending: {} (consecutive failed checks: {})",
+                            + "oldest pending: {} (consecutive failed checks: {}). The low 32 bits of an id match backend_xid in pg_stat_activity and transaction in pg_prepared_xacts",
                     relevantCount(readTables),
                     stuck ? ", one of them for longer than " + TimeUnit.NANOSECONDS.toMillis(maxWaitNanos) + " ms" : "",
                     oldestPending(now, readTables), consecutiveFailedChecks);
