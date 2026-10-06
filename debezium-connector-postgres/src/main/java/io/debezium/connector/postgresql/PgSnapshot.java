@@ -5,12 +5,9 @@
  */
 package io.debezium.connector.postgresql;
 
-import java.util.Arrays;
+import java.util.HashSet;
 import java.util.Objects;
 import java.util.Set;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 import io.debezium.DebeziumException;
 
@@ -20,10 +17,6 @@ import io.debezium.DebeziumException;
  * @author Mario Fiore Vitale
  */
 public class PgSnapshot {
-
-    private static final String SNAPSHOT_FORMAT = "(\\d+):(\\d+):((\\d+,*)+)*";
-    private static final Pattern SNAPSHOT_PATTERN = Pattern.compile(SNAPSHOT_FORMAT);
-    private static final String SEPARATOR = ",";
 
     private final Long xMin;
     private final Long xMax;
@@ -54,25 +47,46 @@ public class PgSnapshot {
      * @return a PgSnapshot representing the {@code snapshotString}
      */
     public static PgSnapshot valueOf(String snapshotString) {
-
-        Matcher matcher = SNAPSHOT_PATTERN.matcher(snapshotString);
-
-        if (matcher.matches()) {
-
-            Long xmin = Long.parseLong(matcher.group(1));
-            Long xmax = Long.parseLong(matcher.group(2));
-
-            Set<Long> xip = Set.of();
-            if (matcher.group(3) != null) {
-                xip = Arrays.stream(matcher.group(3).split(SEPARATOR))
-                        .map(Long::parseLong)
-                        .collect(Collectors.toSet());
+        // Parsed by hand: a regular expression with nested repetition overflows the stack on long lists of running
+        // transactions.
+        if (snapshotString != null) {
+            final int firstColon = snapshotString.indexOf(':');
+            final int secondColon = firstColon < 0 ? -1 : snapshotString.indexOf(':', firstColon + 1);
+            if (firstColon > 0 && secondColon > firstColon + 1) {
+                try {
+                    final long xmin = parseId(snapshotString, 0, firstColon);
+                    final long xmax = parseId(snapshotString, firstColon + 1, secondColon);
+                    final Set<Long> xip = new HashSet<>();
+                    int start = secondColon + 1;
+                    while (start < snapshotString.length()) {
+                        int end = snapshotString.indexOf(',', start);
+                        if (end < 0) {
+                            end = snapshotString.length();
+                        }
+                        if (end > start) {
+                            xip.add(parseId(snapshotString, start, end));
+                        }
+                        start = end + 1;
+                    }
+                    return new PgSnapshot(xmin, xmax, xip);
+                }
+                catch (NumberFormatException e) {
+                    // reported below
+                }
             }
-
-            return new PgSnapshot(xmin, xmax, xip);
         }
 
         throw new DebeziumException(String.format("Unable to parse PgCurrentSnapshot result %s.", snapshotString));
+    }
+
+    private static long parseId(String text, int start, int end) {
+        for (int i = start; i < end; i++) {
+            final char c = text.charAt(i);
+            if (c < '0' || c > '9') {
+                throw new NumberFormatException(text.substring(start, end));
+            }
+        }
+        return Long.parseLong(text, start, end, 10);
     }
 
     @Override

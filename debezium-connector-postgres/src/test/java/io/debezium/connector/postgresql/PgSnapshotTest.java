@@ -38,4 +38,31 @@ public class PgSnapshotTest {
         Assertions.assertThatThrownBy(() -> PgSnapshot.valueOf("795::"))
                 .isInstanceOf(DebeziumException.class);
     }
+
+    @Test
+    void parseRejectsMalformedSnapshots() {
+        for (String malformed : new String[]{ "795:799", ":799:", "795:799:a", "795:x:", "-1:799:", "795:799: 797", "" }) {
+            Assertions.assertThatThrownBy(() -> PgSnapshot.valueOf(malformed))
+                    .as(malformed)
+                    .isInstanceOf(DebeziumException.class);
+        }
+        Assertions.assertThatThrownBy(() -> PgSnapshot.valueOf(null)).isInstanceOf(DebeziumException.class);
+    }
+
+    @Test
+    void parseLongListOfRunningTransactionsWithoutStackOverflow() {
+        final StringBuilder text = new StringBuilder("4294967396:4295067396:");
+        for (long id = 4294967396L; id < 4295067396L; id++) {
+            if (id > 4294967396L) {
+                text.append(',');
+            }
+            text.append(id);
+        }
+
+        PgSnapshot snapshot = PgSnapshot.valueOf(text.toString());
+
+        Assertions.assertThat(snapshot.getXMin()).isEqualTo(4294967396L);
+        Assertions.assertThat(snapshot.getXMax()).isEqualTo(4295067396L);
+        Assertions.assertThat(snapshot.getXip()).hasSize(100_000).contains(4294967396L, 4295067395L);
+    }
 }
