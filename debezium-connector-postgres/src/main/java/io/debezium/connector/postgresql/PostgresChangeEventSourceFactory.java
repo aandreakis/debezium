@@ -119,7 +119,7 @@ public class PostgresChangeEventSourceFactory implements ChangeEventSourceFactor
             return Optional.empty();
         }
 
-        return Optional.of(new PostgresSignalBasedIncrementalSnapshotChangeEventSource(
+        return Optional.of(new PostgresSignalBasedIncrementalSnapshotChangeEventSource<>(
                 configuration,
                 connectionFactory.mainConnection(),
                 dispatcher,

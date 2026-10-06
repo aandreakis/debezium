@@ -17,9 +17,14 @@ import io.debezium.pipeline.source.snapshot.incremental.AbstractIncrementalSnaps
  * A class describing PostgreSQL read only incremental snapshot context state.
  * <p>
  * A chunk's window opens when the chunk is read and is released once the replication stream has been read up to the
- * <em>release position</em>, a WAL position read right after the chunk query. Every transaction the chunk query saw
- * committed before that position, so by then every one of them has been processed, and an event processed in between
- * has removed the buffered row with the same key.
+ * <em>release position</em>, a WAL position read right after the chunk query that is at or after the end of the commit
+ * record of every transaction the query saw. By then every one of those transactions has been processed, and an event
+ * processed in between has removed the buffered row with the same key.
+ * <p>
+ * The window is released at the first processed commit whose position (the end of its commit record) is at or after
+ * the release position, or on an idle stream once the server's sent position reaches it. When the release position is
+ * a standby's replay position, the commit record of a transaction the query saw may still be in replay and end after
+ * it; the stream must then pass the release position, not just reach it.
  *
  * @author Mario Fiore Vitale
  */
@@ -28,6 +33,7 @@ public class PostgresReadOnlyIncrementalSnapshotContext<T> extends AbstractIncre
     private static final Logger LOGGER = LoggerFactory.getLogger(PostgresReadOnlyIncrementalSnapshotContext.class);
 
     private Lsn releasePosition;
+    private boolean mustPass;
 
     public PostgresReadOnlyIncrementalSnapshotContext() {
         this(false);
@@ -49,25 +55,43 @@ public class PostgresReadOnlyIncrementalSnapshotContext<T> extends AbstractIncre
 
     /**
      * A chunk was read; its window is released once the stream has been read up to {@code position}.
+     *
+     * @param mustPass whether the stream must pass {@code position} rather than reach it
      */
-    public void chunkRead(Lsn position) {
-        LOGGER.trace("Chunk read, window released at stream position {}", position);
-        releasePosition = position;
+    public void chunkRead(Lsn position, boolean mustPass) {
+        LOGGER.trace("Chunk read, window released at stream position {}{}", position, mustPass ? " (must be passed)" : "");
+        this.releasePosition = position;
+        this.mustPass = mustPass;
         windowOpened = true;
     }
 
     /**
-     * Whether the window of the chunk read last can be released at the given stream position.
+     * Whether the window can be released after processing a commit whose commit record ends at {@code commitEnd}.
      */
-    public boolean releaseDue(Lsn streamPosition) {
-        return windowOpened && releasePosition != null && streamPosition != null && streamPosition.isValid()
-                && streamPosition.compareTo(releasePosition) >= 0;
+    public boolean releaseDueAtCommit(Lsn commitEnd) {
+        return reached(commitEnd);
+    }
+
+    /**
+     * Whether the window can be released on an idle stream whose server has sent up to {@code serverPosition}.
+     */
+    public boolean releaseDueWhenIdle(Lsn serverPosition) {
+        return reached(serverPosition);
+    }
+
+    private boolean reached(Lsn streamPosition) {
+        if (!windowOpened || releasePosition == null || streamPosition == null || !streamPosition.isValid()) {
+            return false;
+        }
+        final int comparison = streamPosition.compareTo(releasePosition);
+        return mustPass ? comparison > 0 : comparison >= 0;
     }
 
     public void releaseWindow() {
         LOGGER.trace("Window released at release position {}", releasePosition);
         windowOpened = false;
         releasePosition = null;
+        mustPass = false;
     }
 
     public boolean isWindowOpen() {

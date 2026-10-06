@@ -178,6 +178,13 @@ public class PostgresOffsetContext extends CommonOffsetContext<SourceInfo> {
         return lastCommitLsn;
     }
 
+    /**
+     * The id of the transaction of the last processed message, as the decoding plugin sent it; null if unknown.
+     */
+    Long transactionId() {
+        return sourceInfo.txId();
+    }
+
     Operation lastProcessedMessageType() {
         return sourceInfo.messageType();
     }
